@@ -1,36 +1,73 @@
+from text.symbols import symbols
+
+# =============================================================================
 # Audio
-num_mels = 80
-# num_freq = 1024
+# =============================================================================
+n_mels = 80
 n_fft = 2048
 sr = 22050
-# frame_length_ms = 50.
-# frame_shift_ms = 12.5
 preemphasis = 0.97
-frame_shift = 0.0125 # seconds
-frame_length = 0.05 # seconds
-hop_length = int(sr*frame_shift) # samples.
-win_length = int(sr*frame_length) # samples.
-n_mels = 80 # Number of Mel banks to generate
-power = 1.2 # Exponent for amplifying the predicted magnitude
+
+frame_shift = 0.0125
+frame_length = 0.05
+
+hop_length = int(sr * frame_shift)
+win_length = int(sr * frame_length)
+
+power = 1.2
 min_level_db = -100
 ref_level_db = 20
-hidden_size = 256
-embedding_size = 512
 max_db = 100
 ref_db = 20
-    
 n_iter = 60
-# power = 1.5
+
 outputs_per_step = 1
 
+# =============================================================================
+# Text
+# =============================================================================
+cleaners = "english_cleaners"
+n_symbols = len(symbols)
+
+# =============================================================================
+# Model: Tacotron 2 style
+# =============================================================================
+symbols_embedding_dim = 512
+
+encoder_embedding_dim = 512
+encoder_kernel_size = 5
+encoder_n_convolutions = 3
+encoder_dropout = 0.5
+
+attention_rnn_dim = 1024
+decoder_rnn_dim = 1024
+attention_dim = 128
+attention_location_n_filters = 32
+attention_location_kernel_size = 31
+
+prenet_dims = [256, 256]
+
+postnet_embedding_dim = 512
+postnet_kernel_size = 5
+postnet_n_convolutions = 5
+
+max_decoder_steps = 1000
+gate_threshold = 0.5
+p_attention_dropout = 0.1
+p_decoder_dropout = 0.1
+
+# =============================================================================
+# Training
+# =============================================================================
 epochs = 10000
 lr = 0.001
+batch_size = 32
 save_step = 2000
 image_step = 500
-batch_size = 32
 
-cleaners='english_cleaners'
-
-data_path = './data/LJSpeech-1.1'
-checkpoint_path = './checkpoint'
-sample_path = './samples'
+# =============================================================================
+# Paths
+# =============================================================================
+data_path = "./data/LJSpeech-1.1"
+checkpoint_path = "./checkpoint"
+sample_path = "./samples"
