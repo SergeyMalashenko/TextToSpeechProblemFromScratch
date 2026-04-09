@@ -47,9 +47,17 @@ attention_location_kernel_size = 31
 
 prenet_dims = [256, 256]
 
-postnet_embedding_dim = 512
-postnet_kernel_size = 5
-postnet_n_convolutions = 5
+#postnet_embedding_dim = 512
+#postnet_kernel_size = 5
+#postnet_n_convolutions = 5
+
+postnet_cbhg_k = 8
+postnet_bank_channels = 128
+postnet_proj_channels = [256, n_mels]
+postnet_highway_units = 128
+postnet_highway_layers = 4
+postnet_gru_units = 128
+postnet_dropout = 0.5
 
 max_decoder_steps = 1000
 gate_threshold = 0.5
@@ -61,7 +69,8 @@ p_decoder_dropout = 0.1
 # =============================================================================
 epochs = 10000
 lr = 0.001
-batch_size = 32
+#batch_size = 32
+batch_size = 64
 save_step = 2000
 image_step = 500
 
