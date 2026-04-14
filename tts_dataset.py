@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
+import librosa
 import numpy as np
 import pandas as pd
 import torch
@@ -46,6 +47,10 @@ def get_default_paths() -> tuple[Path, Path]:
     metadata_csv = data_root / "metadata.csv"
     features_dir = data_root / "features"
     return metadata_csv, features_dir
+
+
+def get_default_wav_dir() -> Path:
+    return Path(hp.data_path) / "wavs"
 
 
 def make_feature_paths(features_dir: str | Path, utt_id: str) -> tuple[Path, Path]:
@@ -95,9 +100,6 @@ def make_gate_target(mel_length: int) -> np.ndarray:
     Convention:
       - 0 for frames before the final frame
       - 1 from the final frame onward
-
-    For a single utterance before padding, this means:
-      [0, 0, ..., 0, 1]
     """
     if mel_length <= 0:
         raise ValueError(f"mel_length must be positive, got {mel_length}")
@@ -138,9 +140,6 @@ def pad_1d(arr: np.ndarray, target_length: int, pad_value: int | float = 0) -> n
 
 
 def pad_2d_time(arr: np.ndarray, target_length: int, pad_value: float = 0.0) -> np.ndarray:
-    """
-    Pad (T, C) to (target_length, C)
-    """
     if arr.ndim != 2:
         raise ValueError(f"pad_2d_time expects a 2D array, got {arr.shape}")
     if arr.shape[0] >= target_length:
@@ -228,17 +227,13 @@ class BaseTTSDataset(Dataset):
     def load_mel(self, utt_id: str) -> np.ndarray:
         mel_path, _ = make_feature_paths(self.features_dir, utt_id)
         if not mel_path.exists():
-            raise FileNotFoundError(
-                f"Missing mel file: {mel_path} (run prepare_data first)"
-            )
+            raise FileNotFoundError(f"Missing mel file: {mel_path} (run prepare_data first)")
         return load_npy(mel_path, np.float32)
 
     def load_mag(self, utt_id: str) -> np.ndarray:
         _, mag_path = make_feature_paths(self.features_dir, utt_id)
         if not mag_path.exists():
-            raise FileNotFoundError(
-                f"Missing mag file: {mag_path} (run prepare_data first)"
-            )
+            raise FileNotFoundError(f"Missing mag file: {mag_path} (run prepare_data first)")
         return load_npy(mag_path, np.float32)
 
 
@@ -257,22 +252,19 @@ class TacotronDataset(BaseTTSDataset):
         mel = self.load_mel(utt_id)
         mel_input = make_mel_input(mel)
 
-        text_length = int(text.shape[0])
-        mel_length = int(mel.shape[0])
-
         return {
             "utt_id": utt_id,
             "text": text,
             "mel": mel,
             "mel_input": mel_input,
-            "text_length": text_length,
-            "mel_length": mel_length,
+            "text_length": int(text.shape[0]),
+            "mel_length": int(mel.shape[0]),
         }
 
 
-class TacotronPostnetDataset(BaseTTSDataset):
+class MelToMagDataset(BaseTTSDataset):
     """
-    Dataset for mel -> mag training.
+    Dataset for mel -> magnitude training.
     """
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
@@ -288,20 +280,85 @@ class TacotronPostnetDataset(BaseTTSDataset):
         }
 
 
+class VocoderDataset(BaseTTSDataset):
+    """
+    Dataset for mel -> waveform training.
+
+    Returns:
+        mel: (T_mel, n_mels)
+        wav: (T_audio,)
+    """
+
+    def __init__(
+        self,
+        csv_file: str | Path,
+        features_dir: str | Path,
+        wav_dir: str | Path,
+        segment_size: int,
+        cleaners: str | list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        super().__init__(csv_file=csv_file, features_dir=features_dir, cleaners=cleaners)
+        self.wav_dir = Path(wav_dir)
+        self.segment_size = int(segment_size)
+        self.hop_length = int(hp.hop_length)
+
+    def load_wav(self, utt_id: str) -> np.ndarray:
+        wav_path = self.wav_dir / f"{utt_id}.wav"
+        if not wav_path.exists():
+            raise FileNotFoundError(f"Missing wav file: {wav_path}")
+        wav, _ = librosa.load(str(wav_path), sr=hp.sr)
+        return wav.astype(np.float32)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        utt_id = self.get_utt_id(idx)
+        mel = self.load_mel(utt_id)  # (T_mel, n_mels)
+        wav = self.load_wav(utt_id)  # (T_audio,)
+
+        frames_per_segment = max(1, int(np.ceil(self.segment_size / self.hop_length)))
+
+        if mel.shape[0] <= frames_per_segment:
+            mel_start = 0
+        else:
+            mel_start = np.random.randint(0, mel.shape[0] - frames_per_segment + 1)
+
+        mel_end = min(mel.shape[0], mel_start + frames_per_segment)
+        mel_seg = mel[mel_start:mel_end]
+
+        wav_start = mel_start * self.hop_length
+        wav_end = wav_start + self.segment_size
+        wav_seg = wav[wav_start:wav_end]
+
+        if mel_seg.shape[0] < frames_per_segment:
+            mel_seg = np.pad(
+                mel_seg,
+                ((0, frames_per_segment - mel_seg.shape[0]), (0, 0)),
+                mode="constant",
+                constant_values=0.0,
+            )
+
+        if wav_seg.shape[0] < self.segment_size:
+            wav_seg = np.pad(
+                wav_seg,
+                (0, self.segment_size - wav_seg.shape[0]),
+                mode="constant",
+                constant_values=0.0,
+            )
+
+        return {
+            "utt_id": utt_id,
+            "mel": mel_seg.astype(np.float32),
+            "wav": wav_seg.astype(np.float32),
+        }
+
+
+HiFiGANDataset = VocoderDataset
+
+
 # =============================================================================
 # Collate functions
 # =============================================================================
 
 def collate_fn_tacotron(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
-    """
-    Returns:
-      text            : (B, T_text)
-      text_lengths    : (B,)
-      mel_input       : (B, T_mel, n_mels)
-      mel_target      : (B, T_mel, n_mels)
-      gate_target     : (B, T_mel)
-      output_lengths  : (B,)
-    """
     if len(batch) == 0:
         raise ValueError("Empty batch")
     if not isinstance(batch[0], Mapping):
@@ -316,31 +373,10 @@ def collate_fn_tacotron(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tenso
     max_mel_len = max(int(x["mel_length"]) for x in batch)
     max_mel_len = pad_length_to_multiple(max_mel_len, r)
 
-    text = stack_padded_1d(
-        [x["text"] for x in batch],
-        pad_value=0,
-        dtype=np.int64,
-    )
-
-    mel_input = stack_padded_2d(
-        [x["mel_input"] for x in batch],
-        pad_value=0.0,
-        target_length=max_mel_len,
-        dtype=np.float32,
-    )
-
-    mel_target = stack_padded_2d(
-        [x["mel"] for x in batch],
-        pad_value=0.0,
-        target_length=max_mel_len,
-        dtype=np.float32,
-    )
-
-    gate_target = stack_padded_1d(
-        [make_gate_target(int(x["mel_length"])) for x in batch],
-        pad_value=1.0,
-        dtype=np.float32,
-    )
+    text = stack_padded_1d([x["text"] for x in batch], pad_value=0, dtype=np.int64)
+    mel_input = stack_padded_2d([x["mel_input"] for x in batch], pad_value=0.0, target_length=max_mel_len, dtype=np.float32)
+    mel_target = stack_padded_2d([x["mel"] for x in batch], pad_value=0.0, target_length=max_mel_len, dtype=np.float32)
+    gate_target = stack_padded_1d([make_gate_target(int(x["mel_length"])) for x in batch], pad_value=1.0, dtype=np.float32)
 
     if gate_target.shape[1] < max_mel_len:
         gate_target = np.pad(
@@ -360,7 +396,7 @@ def collate_fn_tacotron(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tenso
     }
 
 
-def collate_fn_postnet(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
+def collate_fn_mel2mag(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
     if len(batch) == 0:
         raise ValueError("Empty batch")
     if not isinstance(batch[0], Mapping):
@@ -369,25 +405,31 @@ def collate_fn_postnet(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor
     mel_lengths = np.asarray([int(x["mel_length"]) for x in batch], dtype=np.int64)
     max_mel_len = int(max(mel_lengths))
 
-    mel = stack_padded_2d(
-        [x["mel"] for x in batch],
-        pad_value=0.0,
-        target_length=max_mel_len,
-        dtype=np.float32,
-    )
-
-    mag = stack_padded_2d(
-        [x["mag"] for x in batch],
-        pad_value=0.0,
-        target_length=max_mel_len,
-        dtype=np.float32,
-    )
+    mel = stack_padded_2d([x["mel"] for x in batch], pad_value=0.0, target_length=max_mel_len, dtype=np.float32)
+    mag = stack_padded_2d([x["mag"] for x in batch], pad_value=0.0, target_length=max_mel_len, dtype=np.float32)
 
     return {
         "mel": torch.from_numpy(mel).float(),
         "mag": torch.from_numpy(mag).float(),
         "lengths": torch.from_numpy(mel_lengths).long(),
     }
+
+
+def collate_fn_vocoder(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
+    mel = np.stack([x["mel"] for x in batch], axis=0)   # (B, T_mel, n_mels)
+    wav = np.stack([x["wav"] for x in batch], axis=0)   # (B, T_audio)
+
+    return {
+        "mel": torch.from_numpy(mel).float(),
+        "wav": torch.from_numpy(wav).float(),
+    }
+
+
+collate_fn_hifigan = collate_fn_vocoder
+
+# Backward-compatible aliases
+TacotronPostnetDataset = MelToMagDataset
+collate_fn_postnet = collate_fn_mel2mag
 
 
 # =============================================================================
@@ -405,15 +447,67 @@ def get_tacotron_dataset(
     return TacotronDataset(csv_file=csv_file, features_dir=features_dir)
 
 
-def get_postnet_dataset(
+def get_mel2mag_dataset(
     csv_file: str | Path | None = None,
     features_dir: str | Path | None = None,
-) -> TacotronPostnetDataset:
+) -> MelToMagDataset:
     if csv_file is None or features_dir is None:
         default_csv, default_features = get_default_paths()
         csv_file = default_csv if csv_file is None else csv_file
         features_dir = default_features if features_dir is None else features_dir
-    return TacotronPostnetDataset(csv_file=csv_file, features_dir=features_dir)
+    return MelToMagDataset(csv_file=csv_file, features_dir=features_dir)
+
+
+def get_vocoder_dataset(
+    csv_file: str | Path | None = None,
+    features_dir: str | Path | None = None,
+    wav_dir: str | Path | None = None,
+    segment_size: int | None = None,
+) -> VocoderDataset:
+    default_csv, default_features = get_default_paths()
+    if csv_file is None:
+        csv_file = default_csv
+    if features_dir is None:
+        features_dir = default_features
+    if wav_dir is None:
+        wav_dir = get_default_wav_dir()
+    if segment_size is None:
+        segment_size = int(getattr(hp, "vocoder_segment_size", hp.hop_length * 64))
+
+    return VocoderDataset(
+        csv_file=csv_file,
+        features_dir=features_dir,
+        wav_dir=wav_dir,
+        segment_size=segment_size,
+    )
+
+
+def get_hifigan_dataset(
+    csv_file: str | Path | None = None,
+    features_dir: str | Path | None = None,
+    wav_dir: str | Path | None = None,
+    segment_size: int | None = None,
+) -> HiFiGANDataset:
+    default_csv, default_features = get_default_paths()
+    if csv_file is None:
+        csv_file = default_csv
+    if features_dir is None:
+        features_dir = default_features
+    if wav_dir is None:
+        wav_dir = get_default_wav_dir()
+    if segment_size is None:
+        segment_size = int(getattr(hp, "hifigan_segment_size", hp.hop_length * 64))
+
+    return HiFiGANDataset(
+        csv_file=csv_file,
+        features_dir=features_dir,
+        wav_dir=wav_dir,
+        segment_size=segment_size,
+    )
+
+
+# Backward-compatible alias
+get_postnet_dataset = get_mel2mag_dataset
 
 
 def get_param_size(model: torch.nn.Module) -> int:

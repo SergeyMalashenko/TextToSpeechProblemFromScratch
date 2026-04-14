@@ -87,3 +87,51 @@ transformer_encoder_layers = 4
 transformer_decoder_layers = 4
 transformer_ffn_dim = 1024
 transformer_dropout = 0.1
+
+
+# =============================================================================
+# Mel2Mag model (renamed external PostNet)
+# =============================================================================
+mel2mag_hidden_dim = 512
+mel2mag_kernel_size = 5
+mel2mag_n_convolutions = 5
+mel2mag_dropout = 0.5
+resume_mel2mag_checkpoint = None
+
+# Legacy compatibility aliases
+postnet_hidden_dim = mel2mag_hidden_dim
+postnet_kernel_size = mel2mag_kernel_size
+postnet_n_convolutions = mel2mag_n_convolutions
+
+# =============================================================================
+# Simple neural vocoder
+# =============================================================================
+vocoder_batch_size = 16
+vocoder_lr = 2e-4
+vocoder_epochs = 10000
+vocoder_segment_size = hop_length * 64
+vocoder_checkpoint_path = "./checkpoint_vocoder"
+vocoder_save_step = 5000
+
+# =============================================================================
+# HiFi-GAN
+# =============================================================================
+hifigan_batch_size = 16
+hifigan_lr = 2e-4
+hifigan_epochs = 10000
+hifigan_segment_size = hop_length * 64
+hifigan_checkpoint_path = "./checkpoint_hifigan"
+hifigan_save_step = 5000
+hifigan_val_step = 2000
+hifigan_lambda_fm = 2.0
+hifigan_lambda_mel = 45.0
+
+# The product of the upsample rates should match hop_length.
+# For sr=22050 and frame_shift=0.0125 we have hop_length = 275 = 5 * 5 * 11.
+hifigan_upsample_rates = [5, 5, 11]
+hifigan_upsample_kernel_sizes = [10, 10, 22]
+hifigan_upsample_initial_channel = 512
+hifigan_resblock_kernel_sizes = [3, 7, 11]
+hifigan_resblock_dilation_sizes = [(1, 3, 5), (1, 3, 5), (1, 3, 5)]
+restore_hifigan_step = None
+restore_vocoder_step = None
