@@ -98,6 +98,29 @@ GATE_THRESHOLD = hp_get("gate_threshold", 0.5)
 P_ATTENTION_DROPOUT = hp_get("p_attention_dropout", 0.1)
 P_DECODER_DROPOUT = hp_get("p_decoder_dropout", 0.1)
 
+# =============================================================================
+print("N_MELS "   , N_MELS   )
+print("N_SYMBOLS ", N_SYMBOLS)
+print("R "        , R        )
+print("SYMBOL_EMBED_DIM " , SYMBOL_EMBED_DIM )
+print("ENC_CONV_CHANNELS ", ENC_CONV_CHANNELS)
+print("ENC_CONV_KERNEL "  , ENC_CONV_KERNEL  )
+print("ENC_CONV_LAYERS "  , ENC_CONV_LAYERS  )
+print("ENC_DROPOUT "      , ENC_DROPOUT      )
+print("ATTENTION_RNN_DIM ", ATTENTION_RNN_DIM)
+print("DECODER_RNN_DIM "  , DECODER_RNN_DIM  )
+print("ATTENTION_DIM "    , ATTENTION_DIM    )
+print("ATTENTION_LOCATION_N_FILTERS "   , ATTENTION_LOCATION_N_FILTERS  )
+print("ATTENTION_LOCATION_KERNEL_SIZE " , ATTENTION_LOCATION_KERNEL_SIZE)
+print("PRENET_DIMS "                    , PRENET_DIMS                   )
+print("POSTNET_EMBED_DIM "              , POSTNET_EMBED_DIM             )
+print("POSTNET_KERNEL_SIZE "            , POSTNET_KERNEL_SIZE           )
+print("POSTNET_N_CONVS "                , POSTNET_N_CONVS               )
+print("MAX_DECODER_STEPS "              , MAX_DECODER_STEPS             )
+print("GATE_THRESHOLD "                 , GATE_THRESHOLD                )
+print("P_ATTENTION_DROPOUT "            , P_ATTENTION_DROPOUT           )
+print("P_DECODER_DROPOUT "              , P_DECODER_DROPOUT             )
+# =============================================================================
 
 # =============================================================================
 # Prenet

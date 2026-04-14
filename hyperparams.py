@@ -80,3 +80,10 @@ image_step = 500
 data_path = "./data/LJSpeech-1.1"
 checkpoint_path = "./checkpoint"
 sample_path = "./samples"
+
+transformer_d_model = 256
+transformer_nhead = 4
+transformer_encoder_layers = 4
+transformer_decoder_layers = 4
+transformer_ffn_dim = 1024
+transformer_dropout = 0.1
