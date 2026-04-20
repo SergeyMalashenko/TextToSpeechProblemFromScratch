@@ -15,7 +15,7 @@ import torch
 from scipy import signal
 from scipy.io.wavfile import write
 
-import hyperparams as hp
+import hyperparams_rnn as hp
 from text import text_to_sequence
 
 from tts_hifigan_model import Generator as HiFiGANGenerator
@@ -239,18 +239,16 @@ def resolve_mel2mag_checkpoint(arg_value: str | None) -> Path:
     step = hp_get("restore_step2", None)
     if step is None:
         raise ValueError("MelToMag checkpoint is not provided. Use --mel2mag_ckpt.")
-    candidate = Path(hp.checkpoint_path) / f"checkpoint_mel2mag_{step}.pth.tar"
-    legacy = Path(hp.checkpoint_path) / f"checkpoint_postnet_{step}.pth.tar"
-    return candidate if candidate.exists() else legacy
+    return Path(hp.checkpoint_path) / f"checkpoint_mel2mag_{step}.pth.tar"
 
 
 def resolve_vocoder_checkpoint(arg_value: str | None) -> Path:
     if arg_value:
         return Path(arg_value)
-    step = hp_get("restore_vocoder_step", None)
+    step = hp_get("restore_simple_vocoder_step", hp_get("restore_vocoder_step", None))
     if step is None:
         raise ValueError("Simple vocoder checkpoint is not provided. Use --vocoder_ckpt.")
-    return Path(hp_get("vocoder_checkpoint_path", "./checkpoint_vocoder")) / f"checkpoint_vocoder_{step}.pth.tar"
+    return Path(hp_get("simple_vocoder_checkpoint_path", "./checkpoint_vocoder")) / f"checkpoint_vocoder_{step}.pth.tar"
 
 
 def resolve_hifigan_checkpoint(arg_value: str | None) -> Path:
@@ -457,9 +455,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vocoder_ckpt", type=str, default=None, help="Path to simple neural vocoder checkpoint")
     parser.add_argument("--hifigan_ckpt", type=str, default=None, help="Path to HiFi-GAN checkpoint")
 
-    # Legacy alias
-    parser.add_argument("--postnet_ckpt", type=str, default=None, help="Deprecated alias for --mel2mag_ckpt")
-
     parser.add_argument("--strict", action="store_true", help="Use strict=True when loading checkpoints")
     parser.add_argument("--out_dir", type=str, default=getattr(hp, "sample_path", "./samples"), help="Output directory")
     parser.add_argument("--save_png", action="store_true", help="Save mel spectrogram PNGs")
@@ -512,8 +507,7 @@ def main() -> None:
     hifigan_model = None
 
     if args.backend == "griffinlim":
-        mel2mag_ckpt_arg = args.mel2mag_ckpt if args.mel2mag_ckpt is not None else args.postnet_ckpt
-        mel2mag_ckpt = resolve_mel2mag_checkpoint(mel2mag_ckpt_arg)
+        mel2mag_ckpt = resolve_mel2mag_checkpoint(args.mel2mag_ckpt)
         print(f"MelToMag checkpoint: {mel2mag_ckpt}")
         mel2mag_model = load_mel2mag(mel2mag_ckpt, device=device, strict=args.strict)
 

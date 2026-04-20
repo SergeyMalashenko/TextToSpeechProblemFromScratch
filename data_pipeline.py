@@ -11,7 +11,7 @@ from scipy import signal
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-import hyperparams as hp
+import hyperparams_base as hp
 
 EPS = 1e-5
 

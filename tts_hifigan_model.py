@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import hyperparams as hp
+import hyperparams_base as hp
 
 
 LRELU_SLOPE = 0.1

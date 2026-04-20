@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-import hyperparams as hp
+import hyperparams_base as hp
 from tts_dataset import get_vocoder_dataset, collate_fn_vocoder
 from tts_vocoder_model import SimpleVocoder
 

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import hyperparams as hp
+import hyperparams_base as hp
 
 
 def get_n_mels() -> int:

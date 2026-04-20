@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import hyperparams as hp
+import hyperparams_mel2mag as hp
 
 
 def hp_get(name: str, default):

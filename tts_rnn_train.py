@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-import hyperparams as hp
+import hyperparams_rnn as hp
 from tts_dataset import get_tacotron_dataset, collate_fn_tacotron
 from tts_rnn_model import Tacotron2
 
@@ -612,7 +612,7 @@ def main() -> None:
         guided_attn_sigma=get_guided_attn_sigma(),
     )
 
-    writer = SummaryWriter()
+    writer = SummaryWriter(log_dir=str(Path(hp_get("rnn_log_dir", "./logs"))))
 
     resume_path = hp_get("resume_checkpoint", None)
     start_epoch, global_step = maybe_resume_from_checkpoint(

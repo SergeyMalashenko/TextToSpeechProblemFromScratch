@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-import hyperparams as hp
+import hyperparams_mel2mag as hp
 from tts_dataset import get_mel2mag_dataset, collate_fn_mel2mag
 from tts_mel2mag_model import MelToMagModel
 
@@ -265,7 +265,7 @@ def main() -> None:
 
     optimizer = torch.optim.Adam(model.parameters(), lr=hp.lr)
     scaler = torch.amp.GradScaler(amp_device_type)
-    writer = SummaryWriter()
+    writer = SummaryWriter(log_dir=str(Path(hp_get("mel2mag_log_dir", "./logs"))))
 
     resume_path = hp_get("resume_mel2mag_checkpoint", None)
     start_epoch, global_step = maybe_resume_from_checkpoint(

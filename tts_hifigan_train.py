@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-import hyperparams as hp
+import hyperparams_base as hp
 from tts_dataset import get_hifigan_dataset, collate_fn_hifigan
 from tts_hifigan_model import (
     Generator,
