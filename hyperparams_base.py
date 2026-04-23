@@ -25,7 +25,6 @@ n_iter = 60
 
 outputs_per_step = 1
 
-
 # =============================================================================
 # Text
 # =============================================================================
@@ -40,11 +39,11 @@ n_symbols = len(symbols)
 
 seed = 42
 
-epochs = 3000
+epochs = 300
 lr = 0.001
-batch_size = 64
+batch_size = 32
 
-num_workers = 8
+num_workers = 32
 val_ratio = 0.02
 
 max_checkpoints_to_keep = 5

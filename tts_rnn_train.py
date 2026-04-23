@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -15,7 +14,6 @@ from tqdm import tqdm
 import hyperparams_rnn as hp
 from tts_dataset import get_tacotron_dataset, collate_fn_tacotron
 from tts_rnn_model import Tacotron2
-
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -59,24 +57,48 @@ def get_gate_pos_weight() -> float:
     return float(hp_get("gate_pos_weight", 5.0))
 
 
-def get_log_alignment_every() -> int:
-    return int(hp_get("image_step", 500))
-
-
-def get_checkpoint_every() -> int:
-    return int(hp_get("save_step", 2000))
-
-
-def get_sample_every() -> int:
-    return int(hp_get("sample_step", get_checkpoint_every()))
-
-
 def get_max_checkpoints_to_keep() -> int:
     return int(hp_get("max_checkpoints_to_keep", 5))
 
 
 def get_seed() -> int:
     return int(hp_get("seed", 42))
+
+
+def get_validate_every_epoch() -> int:
+    return int(hp_get("validate_every_epoch", 1))
+
+
+def get_save_every_epoch() -> int:
+    return int(hp_get("save_every_epoch", 1))
+
+
+def get_sample_every_epoch() -> int:
+    return int(hp_get("sample_every_epoch", 1))
+
+
+def get_log_alignment_every_epoch() -> int:
+    return int(hp_get("log_alignment_every_epoch", 1))
+
+
+def get_lr_schedule_type() -> str:
+    return str(hp_get("lr_schedule_type", "warmup_invsqrt_by_epoch"))
+
+
+def get_lr_warmup_epochs() -> int:
+    return int(hp_get("lr_warmup_epochs", 20))
+
+
+def get_lr_hold_epochs() -> int:
+    return int(hp_get("lr_hold_epochs", 0))
+
+
+def get_lr_min() -> float:
+    return float(hp_get("lr_min", 1e-5))
+
+
+def get_lr_decay_gamma() -> float:
+    return float(hp_get("lr_decay_gamma", 0.98))
 
 
 # =============================================================================
@@ -103,17 +125,48 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
-def adjust_learning_rate(
+def adjust_learning_rate_by_epoch(
     optimizer: torch.optim.Optimizer,
-    step_num: int,
-    warmup_step: int = 4000,
+    epoch: int,
+    base_lr: float,
+    schedule_type: str = "warmup_invsqrt_by_epoch",
+    warmup_epochs: int = 20,
+    hold_epochs: int = 0,
+    min_lr: float = 1e-5,
+    decay_gamma: float = 0.98,
 ) -> float:
-    lr = hp.lr * (warmup_step ** 0.5) * min(
-        step_num * (warmup_step ** -1.5),
-        step_num ** -0.5,
-    )
+    """
+    Epoch-based learning-rate schedule.
+
+    Supported modes:
+      - warmup_invsqrt_by_epoch
+      - exponential_by_epoch
+      - constant
+
+    epoch is 0-based.
+    """
+    epoch_1based = epoch + 1
+
+    if schedule_type == "constant":
+        lr = float(base_lr)
+
+    elif schedule_type == "exponential_by_epoch":
+        lr = float(base_lr) * (float(decay_gamma) ** max(0, epoch))
+
+    else:
+        if warmup_epochs > 0 and epoch_1based <= warmup_epochs:
+            lr = float(base_lr) * float(epoch_1based) / float(warmup_epochs)
+        elif epoch_1based <= warmup_epochs + hold_epochs:
+            lr = float(base_lr)
+        else:
+            decay_epoch = epoch_1based - warmup_epochs - hold_epochs
+            lr = float(base_lr) / (float(decay_epoch) ** 0.5)
+
+    lr = max(float(min_lr), float(lr))
+
     for group in optimizer.param_groups:
         group["lr"] = lr
+
     return float(lr)
 
 
@@ -160,8 +213,8 @@ def guided_attention_map(
     t = torch.arange(mel_len, device=device, dtype=dtype) / max(float(mel_len), 1.0)
     n = torch.arange(text_len, device=device, dtype=dtype) / max(float(text_len), 1.0)
 
-    tt = t.unsqueeze(1)  # (T_mel, 1)
-    nn_ = n.unsqueeze(0)  # (1, T_text)
+    tt = t.unsqueeze(1)
+    nn_ = n.unsqueeze(0)
 
     w = 1.0 - torch.exp(-((tt - nn_) ** 2) / (2.0 * sigma * sigma))
     return w
@@ -175,16 +228,11 @@ def guided_attention_loss(
 ) -> torch.Tensor:
     """
     alignments: (B, T_mel, T_text)
-    text_lengths: (B,)
-    mel_lengths: (B,)
-
-    We only compute over valid alignment area.
     """
-    B, T_mel_max, T_text_max = alignments.shape
     total_loss = alignments.new_tensor(0.0)
     total_weight = alignments.new_tensor(0.0)
 
-    for b in range(B):
+    for b in range(alignments.size(0)):
         t_len = int(mel_lengths[b].item())
         n_len = int(text_lengths[b].item())
 
@@ -222,15 +270,15 @@ class Tacotron2Loss(nn.Module):
         outputs: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        mel_before = outputs["mel_before"]      # (B, T, n_mels)
-        mel_after = outputs["mel_after"]        # (B, T, n_mels)
-        gate_logits = outputs["gate"]           # (B, T)
-        alignments = outputs["alignments"]      # (B, T, T_text)
+        mel_before = outputs["mel_before"]
+        mel_after = outputs["mel_after"]
+        gate_logits = outputs["gate"]
+        alignments = outputs["alignments"]
 
-        mel_target = batch["mel_target"]        # (B, T, n_mels)
-        gate_target = batch["gate_target"]      # (B, T)
-        text_lengths = batch["text_lengths"]    # (B,)
-        output_lengths = batch["output_lengths"]# (B,)
+        mel_target = batch["mel_target"]
+        gate_target = batch["gate_target"]
+        text_lengths = batch["text_lengths"]
+        output_lengths = batch["output_lengths"]
 
         mel_before_loss = masked_l1_loss(mel_before, mel_target, output_lengths)
         mel_after_loss = masked_l1_loss(mel_after, mel_target, output_lengths)
@@ -351,7 +399,10 @@ def cleanup_old_checkpoints(checkpoint_dir: str | Path, keep_last_n: int) -> Non
     if not checkpoint_dir.exists():
         return
 
-    checkpoints = sorted(checkpoint_dir.glob("checkpoint_tacotron2_*.pth.tar"), key=lambda p: p.stat().st_mtime)
+    checkpoints = sorted(
+        checkpoint_dir.glob("checkpoint_tacotron2_epoch_*.pth.tar"),
+        key=lambda p: p.stat().st_mtime,
+    )
     if len(checkpoints) <= keep_last_n:
         return
 
@@ -403,8 +454,8 @@ def maybe_resume_from_checkpoint(
 def log_alignment_image(
     writer: SummaryWriter,
     alignments: torch.Tensor,
-    global_step: int,
-    tag: str = "attention/alignment",
+    epoch_index: int,
+    tag: str = "train_epoch/alignment",
 ) -> None:
     """
     alignments: (B, T_mel, T_text)
@@ -412,8 +463,8 @@ def log_alignment_image(
     if alignments.ndim != 3 or alignments.size(0) == 0:
         return
 
-    A = alignments[0].detach().float().cpu().unsqueeze(0)  # (1, T_mel, T_text)
-    writer.add_image(tag, A, global_step)
+    A = alignments[0].detach().float().cpu().unsqueeze(0)
+    writer.add_image(tag, A, epoch_index)
 
 
 @torch.no_grad()
@@ -422,7 +473,7 @@ def save_validation_sample(
     dataset,
     device: torch.device,
     save_dir: str | Path,
-    global_step: int,
+    epoch_index: int,
 ) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -440,8 +491,8 @@ def save_validation_sample(
     mel = outputs["mel_after"][0].detach().cpu()
     align = outputs["alignments"][0].detach().cpu()
 
-    torch.save(mel, save_dir / f"sample_mel_step_{global_step}.pt")
-    torch.save(align, save_dir / f"sample_align_step_{global_step}.pt")
+    torch.save(mel, save_dir / f"sample_mel_epoch_{epoch_index:06d}.pt")
+    torch.save(align, save_dir / f"sample_align_epoch_{epoch_index:06d}.pt")
 
 
 # =============================================================================
@@ -585,7 +636,8 @@ def main() -> None:
         collate_fn=collate_fn_tacotron,
         drop_last=True,
         num_workers=get_num_workers(),
-        pin_memory=torch.cuda.is_available(),
+        #pin_memory=torch.cuda.is_available(),
+        pin_memory=False,
     )
 
     val_loader = DataLoader(
@@ -595,7 +647,8 @@ def main() -> None:
         collate_fn=collate_fn_tacotron,
         drop_last=False,
         num_workers=max(0, get_num_workers() // 2),
-        pin_memory=torch.cuda.is_available(),
+        #pin_memory=torch.cuda.is_available(),
+        pin_memory=False,
     )
 
     model = Tacotron2().to(device)
@@ -603,7 +656,6 @@ def main() -> None:
         model = nn.DataParallel(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=hp.lr)
-
     scaler = torch.amp.GradScaler(amp_device_type)
 
     criterion = Tacotron2Loss(
@@ -631,15 +683,40 @@ def main() -> None:
 
     for epoch in range(start_epoch, hp.epochs):
         model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        epoch_index = epoch + 1
 
-        for batch_idx, batch in enumerate(pbar):
+        current_lr = adjust_learning_rate_by_epoch(
+            optimizer=optimizer,
+            epoch=epoch,
+            base_lr=hp.lr,
+            schedule_type=get_lr_schedule_type(),
+            warmup_epochs=get_lr_warmup_epochs(),
+            hold_epochs=get_lr_hold_epochs(),
+            min_lr=get_lr_min(),
+            decay_gamma=get_lr_decay_gamma(),
+        )
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch_index}/{hp.epochs}")
+
+        epoch_sum = {
+            "loss": 0.0,
+            "mel_loss": 0.0,
+            "gate_loss": 0.0,
+            "attn_loss": 0.0,
+            "mel_before_loss": 0.0,
+            "mel_after_loss": 0.0,
+            "accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "early_stop_rate": 0.0,
+            "p_prev_mean": 0.0,
+            "p_last_mean": 0.0,
+        }
+        n_batches = 0
+        last_outputs = None
+
+        for batch in pbar:
             global_step += 1
-
-            if global_step < 400000:
-                current_lr = adjust_learning_rate(optimizer, global_step)
-            else:
-                current_lr = float(optimizer.param_groups[0]["lr"])
 
             outputs, stats = train_one_step(
                 model=model,
@@ -651,6 +728,11 @@ def main() -> None:
                 amp_device_type=amp_device_type,
             )
 
+            last_outputs = outputs
+            for key in epoch_sum:
+                epoch_sum[key] += float(stats[key])
+            n_batches += 1
+
             pbar.set_postfix(
                 loss=f"{stats['loss']:.4f}",
                 mel=f"{stats['mel_loss']:.4f}",
@@ -659,93 +741,100 @@ def main() -> None:
                 lr=f"{current_lr:.6f}",
             )
 
-            writer.add_scalars(
-                "train/loss",
-                {
-                    "total": stats["loss"],
-                    "mel": stats["mel_loss"],
-                    "gate": stats["gate_loss"],
-                    "guided_attn": stats["attn_loss"],
-                    "mel_before": stats["mel_before_loss"],
-                    "mel_after": stats["mel_after_loss"],
-                },
-                global_step,
+        if n_batches == 0:
+            train_stats = {k: 0.0 for k in epoch_sum}
+        else:
+            train_stats = {k: v / n_batches for k, v in epoch_sum.items()}
+
+        writer.add_scalars(
+            "train_epoch/loss",
+            {
+                "total": train_stats["loss"],
+                "mel": train_stats["mel_loss"],
+                "gate": train_stats["gate_loss"],
+                "guided_attn": train_stats["attn_loss"],
+                "mel_before": train_stats["mel_before_loss"],
+                "mel_after": train_stats["mel_after_loss"],
+            },
+            epoch_index,
+        )
+
+        writer.add_scalars(
+            "train_epoch/stop",
+            {
+                "accuracy": train_stats["accuracy"],
+                "precision": train_stats["precision"],
+                "recall": train_stats["recall"],
+                "early_stop_rate": train_stats["early_stop_rate"],
+                "p_prev_mean": train_stats["p_prev_mean"],
+                "p_last_mean": train_stats["p_last_mean"],
+            },
+            epoch_index,
+        )
+
+        writer.add_scalar("train_epoch/lr", current_lr, epoch_index)
+
+        if (epoch_index % get_log_alignment_every_epoch() == 0) and (last_outputs is not None):
+            log_alignment_image(
+                writer=writer,
+                alignments=last_outputs["alignments"],
+                epoch_index=epoch_index,
+                tag="train_epoch/alignment",
+            )
+
+        if epoch_index % get_validate_every_epoch() == 0:
+            val_stats = validate(
+                model=model,
+                criterion=criterion,
+                dataloader=val_loader,
+                device=device,
+                amp_device_type=amp_device_type,
             )
 
             writer.add_scalars(
-                "train/stop",
+                "val_epoch/loss",
                 {
-                    "accuracy": stats["accuracy"],
-                    "precision": stats["precision"],
-                    "recall": stats["recall"],
-                    "early_stop_rate": stats["early_stop_rate"],
-                    "p_prev_mean": stats["p_prev_mean"],
-                    "p_last_mean": stats["p_last_mean"],
+                    "total": val_stats["loss"],
+                    "mel": val_stats["mel_loss"],
+                    "gate": val_stats["gate_loss"],
+                    "guided_attn": val_stats["attn_loss"],
                 },
-                global_step,
+                epoch_index,
             )
 
-            writer.add_scalar("train/lr", current_lr, global_step)
+            writer.add_scalars(
+                "val_epoch/stop",
+                {
+                    "accuracy": val_stats["accuracy"],
+                    "precision": val_stats["precision"],
+                    "recall": val_stats["recall"],
+                    "early_stop_rate": val_stats["early_stop_rate"],
+                    "p_prev_mean": val_stats["p_prev_mean"],
+                    "p_last_mean": val_stats["p_last_mean"],
+                },
+                epoch_index,
+            )
 
-            if global_step % get_log_alignment_every() == 1:
-                log_alignment_image(
-                    writer=writer,
-                    alignments=outputs["alignments"],
-                    global_step=global_step,
-                    tag="train/alignment",
-                )
+        if epoch_index % get_sample_every_epoch() == 0:
+            save_validation_sample(
+                model=model,
+                dataset=full_dataset,
+                device=device,
+                save_dir=sample_dir,
+                epoch_index=epoch_index,
+            )
 
-            if global_step % get_checkpoint_every() == 0:
-                ckpt_path = checkpoint_dir / f"checkpoint_tacotron2_{global_step}.pth.tar"
-                save_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                    epoch=epoch,
-                    global_step=global_step,
-                    path=ckpt_path,
-                )
-                cleanup_old_checkpoints(checkpoint_dir, keep_last_n=get_max_checkpoints_to_keep())
-
-                val_stats = validate(
-                    model=model,
-                    criterion=criterion,
-                    dataloader=val_loader,
-                    device=device,
-                    amp_device_type=amp_device_type,
-                )
-
-                writer.add_scalars(
-                    "val/loss",
-                    {
-                        "total": val_stats["loss"],
-                        "mel": val_stats["mel_loss"],
-                        "gate": val_stats["gate_loss"],
-                        "guided_attn": val_stats["attn_loss"],
-                    },
-                    global_step,
-                )
-
-                writer.add_scalars(
-                    "val/stop",
-                    {
-                        "accuracy": val_stats["accuracy"],
-                        "precision": val_stats["precision"],
-                        "recall": val_stats["recall"],
-                        "early_stop_rate": val_stats["early_stop_rate"],
-                        "p_prev_mean": val_stats["p_prev_mean"],
-                        "p_last_mean": val_stats["p_last_mean"],
-                    },
-                    global_step,
-                )
-
-                save_validation_sample(
-                    model=model,
-                    dataset=full_dataset,
-                    device=device,
-                    save_dir=sample_dir,
-                    global_step=global_step,
-                )
+        if epoch_index % get_save_every_epoch() == 0:
+            ckpt_path = checkpoint_dir / f"checkpoint_tacotron2_epoch_{epoch_index:06d}.pth.tar"
+            save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch_index,
+                global_step=global_step,
+                path=ckpt_path,
+            )
+            cleanup_old_checkpoints(checkpoint_dir, keep_last_n=get_max_checkpoints_to_keep())
 
     writer.close()
 

@@ -25,7 +25,6 @@ from tts_vocoder_model import SimpleVocoder
 
 
 def spectrogram2wav(mag: np.ndarray) -> np.ndarray:
-    """Generate waveform from normalized linear magnitude spectrogram."""
     mag = mag.T
     mag = (np.clip(mag, 0, 1) * hp.max_db) - hp.max_db + hp.ref_db
     mag = np.power(10.0, mag * 0.05)
@@ -36,7 +35,6 @@ def spectrogram2wav(mag: np.ndarray) -> np.ndarray:
 
 
 def griffin_lim(spectrogram: np.ndarray) -> np.ndarray:
-    """Applies Griffin-Lim."""
     x_best = copy.deepcopy(spectrogram)
     for _ in range(hp.n_iter):
         x_t = invert_spectrogram(x_best)
@@ -62,10 +60,6 @@ def invert_spectrogram(spectrogram: np.ndarray) -> np.ndarray:
         window="hann",
     )
 
-
-# =============================================================================
-# Helpers
-# =============================================================================
 
 LETTER_MAP = {
     "A": "alpha",
@@ -227,10 +221,12 @@ def load_checkpoint_state(path: str | Path, device: torch.device, key: str | Non
 def resolve_tacotron_checkpoint(arg_value: str | None) -> Path:
     if arg_value:
         return Path(arg_value)
-    step = hp_get("restore_step1", None)
-    if step is None:
-        raise ValueError("Tacotron checkpoint is not provided. Use --tacotron_ckpt.")
-    return Path(hp.checkpoint_path) / f"checkpoint_tacotron2_{step}.pth.tar"
+
+    restore_epoch = hp_get("restore_epoch1", None)
+    if restore_epoch is not None:
+        return Path(hp.checkpoint_path) / f"checkpoint_tacotron2_epoch_{int(restore_epoch):06d}.pth.tar"
+
+    raise ValueError("Tacotron checkpoint is not provided. Use --tacotron_ckpt or set restore_epoch1.")
 
 
 def resolve_mel2mag_checkpoint(arg_value: str | None) -> Path:
@@ -443,7 +439,7 @@ def synthesize_one(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tacotron2 synthesis with multiple vocoder backends")
+    parser = argparse.ArgumentParser(description="Tacotron2 synthesis with epoch-based checkpoint naming")
 
     parser.add_argument("--text", type=str, default=None, help="Single text to synthesize")
     parser.add_argument("--text_file", type=str, default=None, help="Path to text file with one utterance per line")
@@ -461,7 +457,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_mag_png", action="store_true", help="Save magnitude spectrogram PNGs")
     parser.add_argument("--save_alignment", action="store_true", help="Save alignment PNG")
     parser.add_argument("--sr", type=int, default=None, help="Optional output sample rate override")
-    parser.add_argument("--wav_gain", type=float, default=1.0, help="Linear gain applied to waveform before saving, e.g. 2.0")
+    parser.add_argument("--wav_gain", type=float, default=1.0, help="Linear gain applied to waveform before saving")
     parser.add_argument("--peak_norm", action="store_true", help="Normalize waveform peak after gain")
     parser.add_argument("--peak_target", type=float, default=0.95, help="Target absolute peak when --peak_norm is enabled")
 
