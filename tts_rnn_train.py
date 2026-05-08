@@ -130,7 +130,7 @@ def adjust_learning_rate_by_epoch(
     epoch: int,
     base_lr: float,
     schedule_type: str = "warmup_invsqrt_by_epoch",
-    warmup_epochs: int = 20,
+    warmup_epochs: int = 30,
     hold_epochs: int = 0,
     min_lr: float = 1e-5,
     decay_gamma: float = 0.98,
@@ -628,7 +628,7 @@ def main() -> None:
         [train_size, val_size],
         generator=torch.Generator().manual_seed(get_seed()),
     )
-
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=hp.batch_size,
@@ -636,8 +636,9 @@ def main() -> None:
         collate_fn=collate_fn_tacotron,
         drop_last=True,
         num_workers=get_num_workers(),
-        #pin_memory=torch.cuda.is_available(),
-        pin_memory=False,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
+        #prefetch_factor=2
     )
 
     val_loader = DataLoader(
@@ -646,9 +647,11 @@ def main() -> None:
         shuffle=False,
         collate_fn=collate_fn_tacotron,
         drop_last=False,
-        num_workers=max(0, get_num_workers() // 2),
-        #pin_memory=torch.cuda.is_available(),
-        pin_memory=False,
+        #num_workers=max(0, get_num_workers() // 2),
+        num_workers=get_num_workers(),
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
+        #prefetch_factor=2
     )
 
     model = Tacotron2().to(device)

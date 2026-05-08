@@ -107,11 +107,47 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
-def adjust_learning_rate(optimizer: torch.optim.Optimizer, step_num: int, warmup_step: int = 4000) -> float:
-    lr = hp.lr * (warmup_step ** 0.5) * min(step_num * (warmup_step ** -1.5), step_num ** -0.5)
+def get_lr_by_epoch(epoch: int) -> float:
+    """
+    Epoch-based piecewise LR schedule.
+
+    epoch is 0-based. All thresholds in hyperparams are 1-based human epoch
+    numbers. This keeps training behavior independent of batch size and
+    DataLoader length.
+    """
+    e = epoch + 1
+    base_lr = float(hp.lr)
+
+    warmup_epochs = int(hp_get("lr_warmup_epochs", 20))
+    decay_epoch_1 = int(hp_get("lr_decay_epoch_1", 150))
+    decay_epoch_2 = int(hp_get("lr_decay_epoch_2", 300))
+    decay_factor_1 = float(hp_get("lr_decay_factor_1", 0.5))
+    decay_factor_2 = float(hp_get("lr_decay_factor_2", 0.25))
+    lr_min = float(hp_get("lr_min", 1e-6))
+
+    if warmup_epochs > 0 and e <= warmup_epochs:
+        lr = base_lr * e / float(warmup_epochs)
+    elif e <= decay_epoch_1:
+        lr = base_lr
+    elif e <= decay_epoch_2:
+        lr = base_lr * decay_factor_1
+    else:
+        lr = base_lr * decay_factor_2
+
+    return max(float(lr), lr_min)
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for group in optimizer.param_groups:
-        group["lr"] = lr
-    return float(lr)
+        group["lr"] = float(lr)
+
+
+def get_clip_grad_norm() -> float:
+    return float(hp_get("clip_grad_norm", 1.0))
+
+
+def get_weight_decay() -> float:
+    return float(hp_get("weight_decay", 1e-4))
 
 
 def average_metric_dict(metric_list: list[Dict[str, float]]) -> Dict[str, float]:
@@ -127,10 +163,10 @@ def average_metric_dict(metric_list: list[Dict[str, float]]) -> Dict[str, float]
 
 class GuidedAttentionScheduler:
     def __init__(self) -> None:
-        self.weight_start = float(hp_get("guided_attn_weight_start", 2.0))
-        self.weight_end = float(hp_get("guided_attn_weight_end", 0.1))
-        self.warmup_epochs = int(hp_get("guided_attn_warmup_epochs", 30))
-        self.decay_epochs = int(hp_get("guided_attn_decay_epochs", 60))
+        self.weight_start  = float(hp_get("guided_attn_weight_start" , 2.0))
+        self.weight_end    = float(hp_get("guided_attn_weight_end"   , 0.1))
+        self.warmup_epochs = int  (hp_get("guided_attn_warmup_epochs", 30 ))
+        self.decay_epochs  = int  (hp_get("guided_attn_decay_epochs" , 60 ))
 
     def get_weight(self, epoch: int) -> float:
         if epoch < self.warmup_epochs:
@@ -430,7 +466,7 @@ def train_one_step(model: nn.Module, criterion: TransformerTacotronLoss, optimiz
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(losses["loss"]).backward()
     scaler.unscale_(optimizer)
-    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    nn.utils.clip_grad_norm_(model.parameters(), get_clip_grad_norm())
     scaler.step(optimizer)
     scaler.update()
 
@@ -520,7 +556,7 @@ def main() -> None:
         collate_fn=collate_fn_tacotron,
         drop_last=True,
         num_workers=get_num_workers(),
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=bool(hp_get("pin_memory", torch.cuda.is_available())),
     )
     val_loader = DataLoader(
         val_dataset,
@@ -529,14 +565,20 @@ def main() -> None:
         collate_fn=collate_fn_tacotron,
         drop_last=False,
         num_workers=max(0, get_num_workers() // 2),
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=bool(hp_get("pin_memory", torch.cuda.is_available())),
     )
 
     model = TransformerTacotron2().to(device)
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(hp.lr))
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(hp.lr),
+        betas=(float(hp_get("adam_beta1", 0.9)), float(hp_get("adam_beta2", 0.98))),
+        eps=float(hp_get("adam_eps", 1e-9)),
+        weight_decay=get_weight_decay(),
+    )
     scaler = torch.amp.GradScaler(amp_device_type)
     criterion = TransformerTacotronLoss(
         gate_pos_weight=get_gate_pos_weight(),
@@ -560,19 +602,25 @@ def main() -> None:
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size  : {len(val_dataset)}")
     print(f"Log dir           : {log_dir}")
+    print(f"Optimizer         : AdamW")
+    print(f"Base LR           : {float(hp.lr):.2e}")
+    print(f"Weight decay      : {get_weight_decay():.2e}")
+    print(f"Clip grad norm    : {get_clip_grad_norm():.2f}")
 
     for epoch in range(start_epoch, int(hp.epochs)):
+        epoch_idx = epoch + 1
+
+        current_lr = get_lr_by_epoch(epoch)
+        set_optimizer_lr(optimizer, current_lr)
+
         current_guided_attn_weight = guided_attn_scheduler.get_weight(epoch)
 
-        pbar = tqdm(train_loader, desc=f"epoch {epoch}")
+        pbar = tqdm(train_loader, desc=f"epoch {epoch_idx}/{int(hp.epochs)}")
         train_epoch_metrics = []
-        epoch_lr_values = []
         last_outputs = None
 
         for batch in pbar:
             global_step += 1
-            current_lr = adjust_learning_rate(optimizer, global_step)
-            epoch_lr_values.append(current_lr)
 
             outputs, metrics = train_one_step(
                 model=model,
@@ -600,10 +648,8 @@ def main() -> None:
             )
 
         train_metrics = average_metric_dict(train_epoch_metrics)
-        epoch_lr_mean = sum(epoch_lr_values) / max(1, len(epoch_lr_values))
-
         print(
-            f"[TRAIN epoch={epoch}] "
+            f"[TRAIN epoch={epoch_idx}] "
             f"loss={train_metrics['loss']:.4f} "
             f"mel={train_metrics['mel_loss']:.4f} "
             f"gate={train_metrics['gate_loss']:.4f} "
@@ -611,22 +657,22 @@ def main() -> None:
             f"sharp={train_metrics['attention_sharpness']:.4f} "
             f"melE={train_metrics['mel_after_energy']:.4f} "
             f"gaw={train_metrics['guided_attn_weight']:.3f} "
-            f"lr={epoch_lr_mean:.2e}"
+            f"lr={current_lr:.2e}"
         )
 
         for key, value in train_metrics.items():
-            writer.add_scalar(f"train/{key}", value, epoch)
-        writer.add_scalar("train/lr", epoch_lr_mean, epoch)
+            writer.add_scalar(f"train/{key}", value, epoch_idx)
+        writer.add_scalar("train/lr", current_lr, epoch_idx)
 
         if (epoch + 1) % get_image_every_epoch() == 0 and last_outputs is not None:
-            log_alignment_image(writer, last_outputs["alignments"].detach(), epoch, tag="attention/transformer_alignment")
+            log_alignment_image(writer, last_outputs["alignments"].detach(), epoch_idx, tag="attention/transformer_alignment")
 
         if (epoch + 1) % get_sample_every_epoch() == 0:
-            save_validation_sample(model, val_dataset, device, sample_dir, epoch)
+            save_validation_sample(model, val_dataset, device, sample_dir, epoch_idx)
 
         if (epoch + 1) % get_checkpoint_every_epoch() == 0:
-            ckpt_path = checkpoint_dir / f"checkpoint_transformer_tacotron2_epoch_{epoch:04d}.pth.tar"
-            save_checkpoint(model, optimizer, scaler, epoch, global_step, ckpt_path)
+            ckpt_path = checkpoint_dir / f"checkpoint_transformer_tacotron2_epoch_{epoch_idx:04d}.pth.tar"
+            save_checkpoint(model, optimizer, scaler, epoch_idx, global_step, ckpt_path)
             cleanup_old_checkpoints(checkpoint_dir, keep_last_n=get_max_checkpoints_to_keep())
             print(f"Saved checkpoint: {ckpt_path}")
 
@@ -635,7 +681,7 @@ def main() -> None:
             val_metrics = validate(model, criterion, val_loader, device, amp_device_type, val_guided_attn_weight)
 
             print(
-                f"[VAL epoch={epoch}] "
+                f"[VAL epoch={epoch_idx}] "
                 f"loss={val_metrics['loss']:.4f} "
                 f"mel={val_metrics['mel_loss']:.4f} "
                 f"gate={val_metrics['gate_loss']:.4f} "
@@ -647,7 +693,7 @@ def main() -> None:
             )
 
             for key, value in val_metrics.items():
-                writer.add_scalar(f"val/{key}", value, epoch)
+                writer.add_scalar(f"val/{key}", value, epoch_idx)
 
     writer.close()
 

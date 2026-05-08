@@ -2,9 +2,9 @@ from hyperparams_base import *
 
 epochs = 300
 lr = 0.005
-batch_size = 32
 
-num_workers = 32
+batch_size = 48
+num_workers = 32 
 
 # =============================================================================
 # Tacotron2 (RNN acoustic model)
