@@ -12,6 +12,10 @@ from torch.utils.data import Dataset, DataLoader
 import hyperparams_base as hp
 from text import text_to_sequence
 
+try:
+    import soundfile as sf
+except ImportError:  # optional fallback
+    sf = None
 
 # =============================================================================
 # Metadata utilities
@@ -59,6 +63,24 @@ def make_feature_paths(features_dir: str | Path, utt_id: str) -> tuple[Path, Pat
     mag_path = features_dir / f"{utt_id}.mag.npy"
     return mel_path, mag_path
 
+def get_default_wavs_dir() -> Path:
+    """
+    Default waveform directory for vocoder training.
+
+    Priority:
+        1. hp.wavs_dir, if defined
+        2. <hp.data_path>/wavs
+    """
+    if hasattr(hp, "wavs_dir"):
+        return Path(hp.wavs_dir)
+    return Path(hp.data_path) / "wavs"
+
+def make_wav_path(wavs_dir: str | Path, utt_id: str) -> Path:
+    """
+    Expected waveform file:
+        <wavs_dir>/<utt_id>.wav
+    """
+    return Path(wavs_dir) / f"{utt_id}.wav"
 
 # =============================================================================
 # Feature helpers
@@ -68,6 +90,31 @@ def load_npy(path: str | Path, dtype: np.dtype) -> np.ndarray:
     arr = np.load(path)
     return arr.astype(dtype, copy=False)
 
+def load_wav(path: str | Path) -> np.ndarray:
+    """
+    Load a waveform as float32 in approximately [-1, 1].
+
+    Requires soundfile or scipy. soundfile is preferred because it returns
+    normalized floating-point audio directly for standard PCM WAV files.
+    """
+    path = Path(path)
+    if sf is not None:
+        wav, _sample_rate = sf.read(path, dtype="float32", always_2d=False)
+    elif scipy_wavfile is not None:
+        _sample_rate, wav = scipy_wavfile.read(path)
+        if np.issubdtype(wav.dtype, np.integer):
+            max_value = float(np.iinfo(wav.dtype).max)
+            wav = wav.astype(np.float32) / max_value
+        else:
+            wav = wav.astype(np.float32, copy=False)
+    else:
+        raise ImportError("Install soundfile or scipy to load wav files for vocoder training")
+
+    if wav.ndim == 2:
+        wav = wav.mean(axis=1)
+    if wav.ndim != 1:
+        raise ValueError(f"Expected mono waveform or stereo waveform, got shape {wav.shape}")
+    return wav.astype(np.float32, copy=False)
 
 def make_mel_input(mel: np.ndarray) -> np.ndarray:
     """
@@ -240,6 +287,14 @@ class BaseTTSDataset(Dataset):
             )
         return load_npy(mag_path, np.float32)
 
+    def load_wav_from_dir(self, utt_id: str, wavs_dir: str | Path) -> np.ndarray:
+        wav_path = make_wav_path(wavs_dir, utt_id)
+        if not wav_path.exists():
+            raise FileNotFoundError(
+                f"Missing wav file: {wav_path} (expected <wavs_dir>/<utt_id>.wav)"
+            )
+        return load_wav(wav_path)
+
 
 # =============================================================================
 # Tacotron dataset
@@ -286,6 +341,37 @@ class TacotronMel2MagDataset(BaseTTSDataset):
             "mel_length": int(mel.shape[0]),
         }
 
+class VocoderDataset(BaseTTSDataset):
+    """
+    Dataset for mel -> waveform vocoder training.
+
+    Returns:
+        mel: (T_mel, n_mels)
+        wav: (T_audio,)
+    """
+
+    def __init__(
+        self,
+        csv_file: str | Path,
+        features_dir: str | Path,
+        wavs_dir: str | Path,
+        cleaners: str | list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        super().__init__(csv_file=csv_file, features_dir=features_dir, cleaners=cleaners)
+        self.wavs_dir = Path(wavs_dir)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        utt_id = self.get_utt_id(idx)
+        mel = self.load_mel(utt_id)
+        wav = self.load_wav_from_dir(utt_id, self.wavs_dir)
+
+        return {
+            "utt_id": utt_id,
+            "mel": mel,
+            "wav": wav,
+            "mel_length": int(mel.shape[0]),
+            "wav_length": int(wav.shape[0]),
+        }
 
 # =============================================================================
 # Collate functions
@@ -379,6 +465,45 @@ def collate_fn_mel2mag(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor
         "lengths": torch.from_numpy(mel_lengths).long(),
     }
 
+def collate_fn_vocoder(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
+    if len(batch) == 0:
+        raise ValueError("Empty batch")
+    if not isinstance(batch[0], Mapping):
+        raise TypeError(f"batch must contain dict-like objects, got {type(batch[0])}")
+
+    mel_lengths = np.asarray([int(x["mel_length"]) for x in batch], dtype=np.int64)
+    wav_lengths = np.asarray([int(x["wav_length"]) for x in batch], dtype=np.int64)
+
+    max_mel_len = int(max(mel_lengths))
+    max_wav_len = int(max(wav_lengths))
+
+    mel = stack_padded_2d(
+        [x["mel"] for x in batch],
+        pad_value=0.0,
+        target_length=max_mel_len,
+        dtype=np.float32,
+    )
+
+    wav = stack_padded_1d(
+        [x["wav"] for x in batch],
+        pad_value=0.0,
+        dtype=np.float32,
+    )
+
+    if wav.shape[1] < max_wav_len:
+        wav = np.pad(
+            wav,
+            ((0, 0), (0, max_wav_len - wav.shape[1])),
+            mode="constant",
+            constant_values=0.0,
+        )
+
+    return {
+        "mel": torch.from_numpy(mel).float(),
+        "wav": torch.from_numpy(wav).float(),
+        "mel_lengths": torch.from_numpy(mel_lengths).long(),
+        "wav_lengths": torch.from_numpy(wav_lengths).long(),
+    }
 
 # =============================================================================
 # Convenience builders
@@ -405,6 +530,18 @@ def get_mel2mag_dataset(
         features_dir = default_features if features_dir is None else features_dir
     return TacotronMel2MagDataset(csv_file=csv_file, features_dir=features_dir)
 
+def get_vocoder_dataset(
+    csv_file: str | Path | None = None,
+    features_dir: str | Path | None = None,
+    wavs_dir: str | Path | None = None,
+) -> VocoderDataset:
+    if csv_file is None or features_dir is None:
+        default_csv, default_features = get_default_paths()
+        csv_file = default_csv if csv_file is None else csv_file
+        features_dir = default_features if features_dir is None else features_dir
+    if wavs_dir is None:
+        wavs_dir = get_default_wavs_dir()
+    return VocoderDataset(csv_file=csv_file, features_dir=features_dir, wavs_dir=wavs_dir)
 
 def get_param_size(model: torch.nn.Module) -> int:
     return int(sum(p.numel() for p in model.parameters()))
