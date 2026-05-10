@@ -269,7 +269,7 @@ class TacotronDataset(BaseTTSDataset):
         }
 
 
-class TacotronPostnetDataset(BaseTTSDataset):
+class TacotronMel2MagDataset(BaseTTSDataset):
     """
     Dataset for mel -> mag training.
     """
@@ -350,7 +350,7 @@ def collate_fn_tacotron(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tenso
     }
 
 
-def collate_fn_postnet(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
+def collate_fn_mel2mag(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
     if len(batch) == 0:
         raise ValueError("Empty batch")
     if not isinstance(batch[0], Mapping):
@@ -395,15 +395,15 @@ def get_tacotron_dataset(
     return TacotronDataset(csv_file=csv_file, features_dir=features_dir)
 
 
-def get_postnet_dataset(
+def get_mel2mag_dataset(
     csv_file: str | Path | None = None,
     features_dir: str | Path | None = None,
-) -> TacotronPostnetDataset:
+) -> TacotronMel2MagDataset:
     if csv_file is None or features_dir is None:
         default_csv, default_features = get_default_paths()
         csv_file = default_csv if csv_file is None else csv_file
         features_dir = default_features if features_dir is None else features_dir
-    return TacotronPostnetDataset(csv_file=csv_file, features_dir=features_dir)
+    return TacotronMel2MagDataset(csv_file=csv_file, features_dir=features_dir)
 
 
 def get_param_size(model: torch.nn.Module) -> int:
