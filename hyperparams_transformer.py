@@ -11,12 +11,14 @@ epochs = 500
 
 # The previous conservative run used lr=1e-4 and improved very slowly.
 # This is still far below the original aggressive lr=1.5e-3.
-lr = 1.5e-4
+#lr = 1.5e-4
+lr = 3.0e-4
+#lr = 4.0e-4
 
 batch_size = 48
 
 # Safer than 32 workers; increase only if the data pipeline is stable.
-num_workers = 4
+num_workers = 16
 
 
 # =============================================================================
@@ -63,7 +65,7 @@ clip_grad_norm = 1.0
 # Recommended train-file behavior:
 # - update LR once per epoch
 # - do not call step-based Noam schedule inside the batch loop
-lr_warmup_epochs = 20
+lr_warmup_epochs = 30
 
 lr_decay_epoch_1 = 180
 lr_decay_epoch_2 = 320
@@ -91,7 +93,7 @@ checkpoint_every_epoch = 25
 # Previous logs showed attn_loss ~= 1e-4 and sharpness ~= 0.10-0.11.
 # Therefore we keep guided attention pressure high for longer instead of
 # decaying it too quickly.
-guided_attn_weight_start = 1.0
+guided_attn_weight_start = 2.0
 guided_attn_weight_end = 0.8
 guided_attn_warmup_epochs = 50
 guided_attn_decay_epochs = 300
