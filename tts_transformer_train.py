@@ -14,7 +14,12 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
 import hyperparams_transformer as hp
-from tts_dataset import get_tacotron_dataset, collate_fn_tacotron
+from tts_dataset import (
+    get_tacotron_dataset, collate_fn_tacotron,
+    compute_dataset_lengths, LengthBucketBatchSampler
+)
+
+
 from tts_transformer_model import TransformerTacotron2
 
 try:
@@ -548,16 +553,40 @@ def main() -> None:
         [train_size, val_size],
         generator=torch.Generator().manual_seed(get_seed()),
     )
+    
+    use_bucket_sampler = bool(getattr(hp, "use_bucket_sampler", True))
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(hp.batch_size),
-        shuffle=True,
-        collate_fn=collate_fn_tacotron,
-        drop_last=True,
-        num_workers=get_num_workers(),
-        pin_memory=bool(hp_get("pin_memory", torch.cuda.is_available())),
-    )
+    if use_bucket_sampler :
+        print("[DataLoader] Using LengthBucketBatchSampler")
+        mel_lengths = compute_dataset_lengths(train_dataset)
+        
+        batch_sampler = LengthBucketBatchSampler(
+            lengths=mel_lengths,
+            batch_size=hp.batch_size,
+            bucket_size=hp.batch_size * 20,
+            shuffle=True,
+            drop_last=False,
+        )
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=batch_sampler,
+            num_workers=hp.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=collate_fn_tacotron,
+        )
+    else:
+        print("[DataLoader] Using plain random sampler")
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=int(hp.batch_size),
+            shuffle=True,
+            collate_fn=collate_fn_tacotron,
+            drop_last=True,
+            num_workers=get_num_workers(),
+            pin_memory=bool(hp_get("pin_memory", torch.cuda.is_available())),
+        )
+    
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(hp.batch_size),

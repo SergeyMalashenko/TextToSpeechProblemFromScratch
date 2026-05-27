@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Dict, Iterator, List, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 
 import hyperparams_base as hp
 from text import text_to_sequence
@@ -16,6 +16,11 @@ try:
     import soundfile as sf
 except ImportError:  # optional fallback
     sf = None
+
+try:
+    from scipy.io import wavfile as scipy_wavfile
+except ImportError:  # optional fallback
+    scipy_wavfile = None
 
 # =============================================================================
 # Metadata utilities
@@ -168,6 +173,241 @@ def get_outputs_per_step() -> int:
     if hasattr(hp, "r"):
         return int(hp.r)
     return 1
+
+
+# =============================================================================
+# Length-aware batch sampling
+# =============================================================================
+
+class LengthBucketBatchSampler(Sampler[List[int]]):
+    """
+    Batch sampler that groups examples with approximately similar lengths.
+
+    This reduces padding waste for variable-length TTS training while preserving
+    enough randomness between epochs.
+
+    Typical Tacotron usage:
+        - use mel lengths as `lengths`
+        - set bucket_size to batch_size * 20 or batch_size * 30
+        - pass this sampler to DataLoader as `batch_sampler`
+        - do not pass `batch_size` or `shuffle` to DataLoader
+    """
+
+    def __init__(
+        self,
+        lengths: Sequence[int],
+        batch_size: int,
+        bucket_size: int | None = None,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int | None = None,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if len(lengths) == 0:
+            raise ValueError("lengths must be non-empty")
+
+        self.lengths = np.asarray(lengths, dtype=np.int64)
+        if np.any(self.lengths <= 0):
+            raise ValueError("all lengths must be positive")
+
+        self.batch_size = int(batch_size)
+        self.bucket_size = int(bucket_size or batch_size * 20)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = seed
+        self.epoch = 0
+
+        if self.bucket_size < self.batch_size:
+            raise ValueError(
+                f"bucket_size must be >= batch_size, got bucket_size={self.bucket_size}, "
+                f"batch_size={self.batch_size}"
+            )
+
+    def set_epoch(self, epoch: int) -> None:
+        """
+        Optional helper for deterministic epoch-dependent shuffling.
+
+        If you use DistributedDataParallel later, call sampler.set_epoch(epoch)
+        at the beginning of each epoch.
+        """
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        rng = np.random.default_rng(None if self.seed is None else self.seed + self.epoch)
+
+        indices = np.arange(len(self.lengths), dtype=np.int64)
+
+        # A small pre-shuffle makes examples with identical/similar lengths vary
+        # before the stable sorting step.
+        if self.shuffle:
+            rng.shuffle(indices)
+
+        indices = indices[np.argsort(self.lengths[indices], kind="stable")]
+
+        buckets: List[np.ndarray] = [
+            indices[i : i + self.bucket_size]
+            for i in range(0, len(indices), self.bucket_size)
+        ]
+
+        if self.shuffle:
+            rng.shuffle(buckets)
+
+        batches: List[List[int]] = []
+        for bucket in buckets:
+            bucket = bucket.copy()
+            if self.shuffle:
+                rng.shuffle(bucket)
+
+            for start in range(0, len(bucket), self.batch_size):
+                batch = bucket[start : start + self.batch_size].tolist()
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append([int(i) for i in batch])
+
+        if self.shuffle:
+            rng.shuffle(batches)
+
+        yield from batches
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return int(np.ceil(len(self.lengths) / self.batch_size))
+
+
+def compute_dataset_lengths(
+    dataset: Dataset,
+    mode: str = "mel",
+    cache_path: str | Path | None = None,
+    force_recompute: bool = False,
+) -> np.ndarray:
+    """
+    Compute or load per-example sequence lengths.
+
+    Supported modes:
+        "mel"  - length of mel spectrogram, preferred for Tacotron batching
+        "text" - length of encoded text
+        "wav"  - waveform length, useful for vocoder batching
+
+    The function works with the dataset classes defined in this file. For other
+    datasets, it falls back to reading __getitem__(idx) and checking common keys.
+    """
+    mode = str(mode).lower().strip()
+    if mode not in {"mel", "text", "wav"}:
+        raise ValueError(f"Unsupported length mode: {mode!r}. Use 'mel', 'text', or 'wav'.")
+
+    if cache_path is not None:
+        cache_path = Path(cache_path)
+        if cache_path.exists() and not force_recompute:
+            lengths = np.load(cache_path)
+            if len(lengths) != len(dataset):
+                raise ValueError(
+                    f"Length cache size mismatch: cache has {len(lengths)} entries, "
+                    f"dataset has {len(dataset)} entries. Recompute the cache."
+                )
+            return lengths.astype(np.int64, copy=False)
+
+    lengths: List[int] = []
+
+    for idx in range(len(dataset)):
+        if mode == "mel" and hasattr(dataset, "load_mel") and hasattr(dataset, "get_utt_id"):
+            utt_id = dataset.get_utt_id(idx)  # type: ignore[attr-defined]
+            value = int(dataset.load_mel(utt_id).shape[0])  # type: ignore[attr-defined]
+        elif mode == "text" and hasattr(dataset, "encode_text") and hasattr(dataset, "get_text_raw"):
+            text = dataset.encode_text(dataset.get_text_raw(idx))  # type: ignore[attr-defined]
+            value = int(text.shape[0])
+        elif mode == "wav" and hasattr(dataset, "load_wav_from_dir") and hasattr(dataset, "get_utt_id") and hasattr(dataset, "wavs_dir"):
+            utt_id = dataset.get_utt_id(idx)  # type: ignore[attr-defined]
+            wav = dataset.load_wav_from_dir(utt_id, dataset.wavs_dir)  # type: ignore[attr-defined]
+            value = int(wav.shape[0])
+        else:
+            item = dataset[idx]  # type: ignore[index]
+            key = f"{mode}_length"
+            if key in item:
+                value = int(item[key])
+            elif mode in item:
+                value = int(item[mode].shape[0])
+            else:
+                raise KeyError(
+                    f"Cannot infer {mode!r} length for item {idx}. "
+                    f"Expected key {key!r} or {mode!r}."
+                )
+
+        if value <= 0:
+            raise ValueError(f"Non-positive length for item {idx}: {value}")
+        lengths.append(value)
+
+    lengths_arr = np.asarray(lengths, dtype=np.int64)
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_path, lengths_arr)
+
+    return lengths_arr
+
+
+def make_length_bucketed_loader(
+    dataset: Dataset,
+    collate_fn,
+    batch_size: int | None = None,
+    length_mode: str = "mel",
+    bucket_size: int | None = None,
+    lengths: Sequence[int] | None = None,
+    lengths_cache_path: str | Path | None = None,
+    force_recompute_lengths: bool = False,
+    shuffle: bool = True,
+    drop_last: bool = False,
+    num_workers: int | None = None,
+    pin_memory: bool | None = None,
+    seed: int | None = None,
+    **dataloader_kwargs: Any,
+) -> DataLoader:
+    """
+    Build a DataLoader that uses LengthBucketBatchSampler.
+
+    Important:
+        DataLoader receives `batch_sampler`, therefore do not pass `batch_size`,
+        `shuffle`, `sampler`, or `drop_last` through dataloader_kwargs.
+    """
+    if batch_size is None:
+        batch_size = _get_batch_size()
+    if num_workers is None:
+        num_workers = _get_num_workers()
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+
+    forbidden = {"batch_size", "shuffle", "sampler", "batch_sampler", "drop_last"}
+    bad_keys = forbidden.intersection(dataloader_kwargs.keys())
+    if bad_keys:
+        raise ValueError(
+            "Do not pass these arguments with batch_sampler: " + ", ".join(sorted(bad_keys))
+        )
+
+    if lengths is None:
+        lengths = compute_dataset_lengths(
+            dataset,
+            mode=length_mode,
+            cache_path=lengths_cache_path,
+            force_recompute=force_recompute_lengths,
+        )
+
+    batch_sampler = LengthBucketBatchSampler(
+        lengths=lengths,
+        batch_size=batch_size,
+        bucket_size=bucket_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        seed=seed,
+    )
+
+    return DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn,
+        **dataloader_kwargs,
+    )
 
 
 # =============================================================================
@@ -563,11 +803,15 @@ def _get_batch_size() -> int:
     return 4
 
 
-def run_one_pass_over_tacotron_dataset() -> None:
-    dataset = get_tacotron_dataset()
-
+def _print_tacotron_dataset_smoke_test_header(
+    title: str,
+    dataset: Dataset,
+    *,
+    bucket_sampler_enabled: bool,
+    bucket_size: int | None = None,
+) -> None:
     print("=" * 80)
-    print("Tacotron dataset smoke test")
+    print(title)
     print("=" * 80)
     print(f"Dataset size     : {len(dataset)}")
     print(f"Metadata path    : {get_default_paths()[0]}")
@@ -575,18 +819,13 @@ def run_one_pass_over_tacotron_dataset() -> None:
     print(f"Batch size       : {_get_batch_size()}")
     print(f"Num workers      : {_get_num_workers()}")
     print(f"Outputs per step : {get_outputs_per_step()}")
+    print(f"Bucket sampler   : {'enabled' if bucket_sampler_enabled else 'disabled'}")
+    if bucket_size is not None:
+        print(f"Bucket size      : {bucket_size}")
     print("-" * 80)
 
-    loader = DataLoader(
-        dataset,
-        batch_size=_get_batch_size(),
-        shuffle=False,
-        num_workers=_get_num_workers(),
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=collate_fn_tacotron,
-        drop_last=False,
-    )
 
+def _run_one_pass_over_tacotron_loader(loader: DataLoader) -> None:
     total_batches = 0
     total_samples = 0
 
@@ -611,5 +850,70 @@ def run_one_pass_over_tacotron_dataset() -> None:
     print("=" * 80)
 
 
+def run_one_pass_over_tacotron_dataset_plain_sampler() -> None:
+    """
+    Smoke test for the baseline Tacotron DataLoader.
+
+    This uses the standard DataLoader batching logic:
+        - batch_size is passed directly to DataLoader
+        - shuffle is disabled for deterministic inspection
+        - no length bucketing is used
+    """
+    dataset = get_tacotron_dataset()
+
+    _print_tacotron_dataset_smoke_test_header(
+        "Tacotron dataset smoke test: plain sampler",
+        dataset,
+        bucket_sampler_enabled=False,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=_get_batch_size(),
+        shuffle=False,
+        num_workers=_get_num_workers(),
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=collate_fn_tacotron,
+        drop_last=False,
+    )
+
+    _run_one_pass_over_tacotron_loader(loader)
+
+
+def run_one_pass_over_tacotron_dataset_bucket_sampler() -> None:
+    """
+    Smoke test for the length-bucketed Tacotron DataLoader.
+
+    This uses LengthBucketBatchSampler:
+        - batch_size is controlled by the batch sampler
+        - DataLoader receives batch_sampler=...
+        - DataLoader must not receive batch_size, shuffle, or drop_last
+    """
+    dataset = get_tacotron_dataset()
+    bucket_size = int(getattr(hp, "bucket_size", _get_batch_size() * 20))
+
+    _print_tacotron_dataset_smoke_test_header(
+        "Tacotron dataset smoke test: length bucket sampler",
+        dataset,
+        bucket_sampler_enabled=True,
+        bucket_size=bucket_size,
+    )
+
+    loader = make_length_bucketed_loader(
+        dataset=dataset,
+        collate_fn=collate_fn_tacotron,
+        batch_size=_get_batch_size(),
+        bucket_size=bucket_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=_get_num_workers(),
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    _run_one_pass_over_tacotron_loader(loader)
+
+
+
 if __name__ == "__main__":
-    run_one_pass_over_tacotron_dataset()
+    run_one_pass_over_tacotron_dataset_plain_sampler()
+    run_one_pass_over_tacotron_dataset_bucket_sampler()

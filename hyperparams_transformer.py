@@ -12,7 +12,7 @@ epochs = 500
 # The previous conservative run used lr=1e-4 and improved very slowly.
 # This is still far below the original aggressive lr=1.5e-3.
 #lr = 1.5e-4
-lr = 3.0e-4
+lr = 3.5e-4
 #lr = 4.0e-4
 
 batch_size = 48
@@ -65,11 +65,15 @@ clip_grad_norm = 1.0
 # Recommended train-file behavior:
 # - update LR once per epoch
 # - do not call step-based Noam schedule inside the batch loop
-lr_warmup_epochs = 30
+lr_warmup_epochs = 50
 
-lr_decay_epoch_1 = 180
-lr_decay_epoch_2 = 320
-lr_decay_epoch_3 = 430
+#lr_decay_epoch_1 = 200
+#lr_decay_epoch_2 = 350
+#lr_decay_epoch_3 = 450
+
+lr_decay_epoch_1 = 250
+lr_decay_epoch_2 = 325
+lr_decay_epoch_3 = 400
 
 lr_decay_factor_1 = 0.5
 lr_decay_factor_2 = 0.25
