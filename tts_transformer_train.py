@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -21,6 +22,7 @@ from tts_dataset import (
 
 
 from tts_transformer_model import TransformerTacotron2
+from tts_tacotron_losses import Tacotron2Loss, sequence_mask
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -60,6 +62,10 @@ def get_guided_attn_sigma() -> float:
     return float(hp_get("guided_attn_sigma", 0.2))
 
 
+def get_attention_entropy_weight() -> float:
+    return float(hp_get("attention_entropy_weight", 0.0))
+
+
 def get_val_every_epoch() -> int:
     return int(hp_get("val_every_epoch", 1))
 
@@ -96,16 +102,48 @@ def get_samples_dir() -> Path:
     return Path(hp_get("sample_path", "./samples")) / "transformer_tacotron"
 
 
+def _safe_experiment_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        return ""
+    safe_chars = []
+    for ch in name:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe_chars.append(ch)
+        else:
+            safe_chars.append("_")
+    return "".join(safe_chars).strip("_")
+
+
+def create_experiment_log_dir(base_dir: str | Path, prefix: str) -> Path:
+    """
+    Creates a separate TensorBoard directory for each experiment run.
+
+    Example:
+        ./logs/transformer_tacotron/transformer_20260616_173245/
+        ./logs/transformer_tacotron/transformer_20260616_173245_my_experiment/
+    """
+    base_dir = Path(base_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment_name = _safe_experiment_name(str(hp_get("experiment_name", "")))
+
+    run_name = f"{prefix}_{timestamp}"
+    if experiment_name:
+        run_name = f"{run_name}_{experiment_name}"
+
+    run_dir = base_dir / run_name
+    suffix = 1
+    while run_dir.exists():
+        run_dir = base_dir / f"{run_name}_{suffix:02d}"
+        suffix += 1
+
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def sequence_mask(lengths: torch.Tensor, max_len: Optional[int] = None) -> torch.Tensor:
-    if max_len is None:
-        max_len = int(lengths.max().item())
-    ids = torch.arange(max_len, device=lengths.device)
-    return ids.unsqueeze(0) < lengths.unsqueeze(1)
 
 
 def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -184,75 +222,6 @@ class GuidedAttentionScheduler:
         weight = self.weight_end + (self.weight_start - self.weight_end) * cosine
         return float(weight)
 
-
-def masked_l1_loss(pred: torch.Tensor, target: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-    mask = sequence_mask(lengths, max_len=pred.size(1)).unsqueeze(-1).to(pred.dtype)
-    loss = torch.abs(pred - target) * mask
-    denom = mask.sum() * pred.size(-1)
-    return loss.sum() / denom.clamp_min(1.0)
-
-
-def gate_bce_loss(gate_logits: torch.Tensor, gate_target: torch.Tensor, pos_weight_value: float) -> torch.Tensor:
-    pos_weight = torch.tensor([pos_weight_value], device=gate_logits.device, dtype=gate_logits.dtype)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    return criterion(gate_logits, gate_target)
-
-
-def guided_attention_map(mel_len: int, text_len: int, sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    t = torch.arange(mel_len, device=device, dtype=dtype) / max(float(mel_len), 1.0)
-    n = torch.arange(text_len, device=device, dtype=dtype) / max(float(text_len), 1.0)
-    tt = t.unsqueeze(1)
-    nn_ = n.unsqueeze(0)
-    return 1.0 - torch.exp(-((tt - nn_) ** 2) / (2.0 * sigma * sigma))
-
-
-def guided_attention_loss(alignments: torch.Tensor, text_lengths: torch.Tensor, mel_lengths: torch.Tensor, sigma: float) -> torch.Tensor:
-    total_loss = alignments.new_tensor(0.0)
-    total_weight = alignments.new_tensor(0.0)
-    for b in range(alignments.size(0)):
-        t_len = int(mel_lengths[b].item())
-        n_len = int(text_lengths[b].item())
-        if t_len <= 0 or n_len <= 0:
-            continue
-        A = alignments[b, :t_len, :n_len]
-        W = guided_attention_map(t_len, n_len, sigma, alignments.device, alignments.dtype)
-        total_loss = total_loss + (A * W).sum()
-        total_weight = total_weight + torch.tensor(float(t_len * n_len), device=alignments.device, dtype=alignments.dtype)
-    return total_loss / total_weight.clamp_min(1.0)
-
-
-class TransformerTacotronLoss(nn.Module):
-    def __init__(self, gate_pos_weight: float = 10.0, gate_loss_weight: float = 2.0, guided_attn_sigma: float = 0.2) -> None:
-        super().__init__()
-        self.gate_pos_weight = gate_pos_weight
-        self.gate_loss_weight = gate_loss_weight
-        self.guided_attn_sigma = guided_attn_sigma
-
-    def forward(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], guided_attn_weight: float) -> Dict[str, torch.Tensor]:
-        mel_before = outputs["mel_before"]
-        mel_after = outputs["mel_after"]
-        gate_logits = outputs["gate"]
-        alignments = outputs["alignments"]
-        mel_target = batch["mel_target"]
-        gate_target = batch["gate_target"]
-        text_lengths = batch["text_lengths"]
-        output_lengths = batch["output_lengths"]
-
-        mel_before_loss = masked_l1_loss(mel_before, mel_target, output_lengths)
-        mel_after_loss = masked_l1_loss(mel_after, mel_target, output_lengths)
-        mel_loss = mel_before_loss + mel_after_loss
-        gate_loss = gate_bce_loss(gate_logits, gate_target, self.gate_pos_weight)
-        attn_loss = guided_attention_loss(alignments, text_lengths, output_lengths, self.guided_attn_sigma)
-
-        total_loss = mel_loss + self.gate_loss_weight * gate_loss + guided_attn_weight * attn_loss
-        return {
-            "loss": total_loss,
-            "mel_loss": mel_loss,
-            "gate_loss": gate_loss,
-            "attn_loss": attn_loss,
-            "mel_before_loss": mel_before_loss,
-            "mel_after_loss": mel_after_loss,
-        }
 
 
 @torch.no_grad()
@@ -450,7 +419,7 @@ def save_validation_sample(model: nn.Module, dataset, device: torch.device, save
     torch.save(outputs["alignments"][0].detach().cpu(), save_dir / f"transformer_sample_align_epoch_{epoch:04d}.pt")
 
 
-def train_one_step(model: nn.Module, criterion: TransformerTacotronLoss, optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler, batch: Dict[str, torch.Tensor], device: torch.device, amp_device_type: str, guided_attn_weight: float) -> tuple[Dict[str, torch.Tensor], Dict[str, float]]:
+def train_one_step(model: nn.Module, criterion: Tacotron2Loss, optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler, batch: Dict[str, torch.Tensor], device: torch.device, amp_device_type: str, guided_attn_weight: float) -> tuple[Dict[str, torch.Tensor], Dict[str, float]]:
     batch = move_batch_to_device(batch, device)
 
     with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
@@ -491,7 +460,7 @@ def train_one_step(model: nn.Module, criterion: TransformerTacotronLoss, optimiz
 
 
 @torch.no_grad()
-def validate(model: nn.Module, criterion: TransformerTacotronLoss, dataloader: DataLoader, device: torch.device, amp_device_type: str, guided_attn_weight: float) -> Dict[str, float]:
+def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader, device: torch.device, amp_device_type: str, guided_attn_weight: float) -> Dict[str, float]:
     model.eval()
     totals = defaultdict(float)
     n_batches = 0
@@ -609,18 +578,18 @@ def main() -> None:
         weight_decay=get_weight_decay(),
     )
     scaler = torch.amp.GradScaler(amp_device_type)
-    criterion = TransformerTacotronLoss(
+    criterion = Tacotron2Loss(
         gate_pos_weight=get_gate_pos_weight(),
         gate_loss_weight=get_gate_loss_weight(),
         guided_attn_sigma=get_guided_attn_sigma(),
+        attention_entropy_weight=get_attention_entropy_weight(),
     ).to(device)
 
     guided_attn_scheduler = GuidedAttentionScheduler()
 
     checkpoint_dir = get_checkpoint_dir()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    log_dir = get_log_dir()
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = create_experiment_log_dir(get_log_dir(), prefix="transformer")
     writer = SummaryWriter(log_dir=str(log_dir))
     sample_dir = get_samples_dir()
     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -631,10 +600,20 @@ def main() -> None:
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size  : {len(val_dataset)}")
     print(f"Log dir           : {log_dir}")
+    print(f"Checkpoint dir    : {checkpoint_dir}")
+    print(f"Sample dir        : {sample_dir}")
     print(f"Optimizer         : AdamW")
     print(f"Base LR           : {float(hp.lr):.2e}")
     print(f"Weight decay      : {get_weight_decay():.2e}")
     print(f"Clip grad norm    : {get_clip_grad_norm():.2f}")
+    print(f"Entropy loss w    : {get_attention_entropy_weight():.3e}")
+    print(f"Seed              : {get_seed()}")
+
+    writer.add_text("config/log_dir", str(log_dir), 0)
+    writer.add_text("config/seed", str(get_seed()), 0)
+    writer.add_text("config/optimizer", "AdamW", 0)
+    writer.add_text("config/base_lr", f"{float(hp.lr):.6e}", 0)
+    writer.add_text("config/weight_decay", f"{get_weight_decay():.6e}", 0)
 
     for epoch in range(start_epoch, int(hp.epochs)):
         epoch_idx = epoch + 1

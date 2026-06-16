@@ -1,13 +1,17 @@
 from hyperparams_base import *
 
-epochs = 300
-lr = 0.005
+# =============================================================================
+# Training
+# =============================================================================
 
-batch_size = 48
-num_workers = 32 
+epochs = 300
+lr = 1e-3
+
+batch_size = 64
+num_workers = 32
 
 # =============================================================================
-# Tacotron2 (RNN acoustic model)
+# Tacotron2 model
 # =============================================================================
 
 symbols_embedding_dim = 512
@@ -19,6 +23,7 @@ encoder_dropout = 0.5
 
 attention_rnn_dim = 1024
 decoder_rnn_dim = 1024
+
 attention_dim = 128
 attention_location_n_filters = 32
 attention_location_kernel_size = 31
@@ -35,52 +40,45 @@ gate_threshold = 0.5
 p_attention_dropout = 0.1
 p_decoder_dropout = 0.1
 
-
 # =============================================================================
-# Loss configuration
+# Loss
 # =============================================================================
 
 guided_attn_weight = 1.0
 guided_attn_sigma = 0.4
 gate_pos_weight = 5.0
 
+# =============================================================================
+# Attention metrics
+# =============================================================================
+
+attention_diag_width = 0.08
+attention_peak_threshold = 0.6
 
 # =============================================================================
-# Resume / restore
+# Dataset split
+# =============================================================================
+
+val_ratio = 0.02
+
+# =============================================================================
+# Logging / checkpoints
+# =============================================================================
+
+image_step = 500
+save_step = 2000
+sample_step = 2000
+
+max_checkpoints_to_keep = 5
+
+# =============================================================================
+# Resume
 # =============================================================================
 
 resume_checkpoint = None
-restore_epoch1 = None
-restore_step2 = None
-
 
 # =============================================================================
-# Epoch-based learning-rate schedule
-# =============================================================================
-# Supported values:
-#   - "warmup_invsqrt_by_epoch"
-#   - "exponential_by_epoch"
-#   - "constant"
-
-lr_schedule_type = "warmup_invsqrt_by_epoch"
-lr_warmup_epochs = 20
-lr_hold_epochs = 0
-lr_min = 1e-5
-lr_decay_gamma = 0.98
-
-
-# =============================================================================
-# Epoch-based workflow cadence
-# =============================================================================
-
-validate_every_epoch = 1
-save_every_epoch = 1
-sample_every_epoch = 1
-log_alignment_every_epoch = 1
-
-
-# =============================================================================
-# Logging
+# TensorBoard
 # =============================================================================
 
 log_dir = rnn_log_dir

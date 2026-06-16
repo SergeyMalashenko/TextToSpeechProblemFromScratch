@@ -122,8 +122,6 @@ gate_pos_weight = 2.0
 
 resume_transformer_tacotron_path = None
 restore_transformer_epoch = None
-restore_transformer_step = None  # legacy compatibility if synthesis still uses steps
-
 
 # =============================================================================
 # Logging
