@@ -69,15 +69,12 @@ lr_warmup_epochs = 50
 
 #lr_decay_epoch_1 = 200
 #lr_decay_epoch_2 = 350
-#lr_decay_epoch_3 = 450
 
 lr_decay_epoch_1 = 250
 lr_decay_epoch_2 = 325
-lr_decay_epoch_3 = 400
 
 lr_decay_factor_1 = 0.5
 lr_decay_factor_2 = 0.25
-lr_decay_factor_3 = 0.1
 
 
 # =============================================================================
@@ -110,9 +107,6 @@ guided_attn_sigma = 0.45
 # Gate loss
 # =============================================================================
 
-# Previous logs showed gate_loss already very small and acc ~= 0.998.
-# Reduce gate pressure so optimization focuses more on mel + alignment.
-gate_loss_weight = 0.25
 gate_pos_weight = 2.0
 
 

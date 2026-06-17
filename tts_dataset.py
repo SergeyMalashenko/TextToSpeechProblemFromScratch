@@ -151,8 +151,6 @@ def make_gate_target(mel_length: int) -> np.ndarray:
 
     gate = np.zeros((mel_length,), dtype=np.float32)
 
-    #positive_region = int(getattr(hp, "gate_positive_region", 1))
-    #start_idx = max(0, mel_length - positive_region)
     gate[mel_length-1:] = 1.0
     
     return gate

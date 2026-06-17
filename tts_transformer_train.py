@@ -54,16 +54,8 @@ def get_gate_pos_weight() -> float:
     return float(hp_get("gate_pos_weight", 10.0))
 
 
-def get_gate_loss_weight() -> float:
-    return float(hp_get("gate_loss_weight", 2.0))
-
-
 def get_guided_attn_sigma() -> float:
     return float(hp_get("guided_attn_sigma", 0.2))
-
-
-def get_attention_entropy_weight() -> float:
-    return float(hp_get("attention_entropy_weight", 0.0))
 
 
 def get_val_every_epoch() -> int:
@@ -346,6 +338,10 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, nn.DataParallel) else model
 
 
+def set_guided_attn_weight(criterion: Tacotron2Loss, weight: float) -> None:
+    criterion.guided_attn_weight = float(weight)
+
+
 def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler, epoch: int, global_step: int, path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -421,6 +417,7 @@ def save_validation_sample(model: nn.Module, dataset, device: torch.device, save
 
 def train_one_step(model: nn.Module, criterion: Tacotron2Loss, optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler, batch: Dict[str, torch.Tensor], device: torch.device, amp_device_type: str, guided_attn_weight: float) -> tuple[Dict[str, torch.Tensor], Dict[str, float]]:
     batch = move_batch_to_device(batch, device)
+    set_guided_attn_weight(criterion, guided_attn_weight)
 
     with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
         outputs = model(
@@ -429,7 +426,7 @@ def train_one_step(model: nn.Module, criterion: Tacotron2Loss, optimizer: torch.
             mel_input=batch["mel_input"],
             output_lengths=batch["output_lengths"],
         )
-        losses = criterion(outputs, batch, guided_attn_weight=guided_attn_weight)
+        losses = criterion(outputs=outputs, batch=batch)
 
     check_finite_tensor("mel_before", outputs["mel_before"])
     check_finite_tensor("mel_after", outputs["mel_after"])
@@ -462,6 +459,7 @@ def train_one_step(model: nn.Module, criterion: Tacotron2Loss, optimizer: torch.
 @torch.no_grad()
 def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader, device: torch.device, amp_device_type: str, guided_attn_weight: float) -> Dict[str, float]:
     model.eval()
+    set_guided_attn_weight(criterion, guided_attn_weight)
     totals = defaultdict(float)
     n_batches = 0
 
@@ -474,7 +472,7 @@ def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader,
                 mel_input=batch["mel_input"],
                 output_lengths=batch["output_lengths"],
             )
-            losses = criterion(outputs, batch, guided_attn_weight=guided_attn_weight)
+            losses = criterion(outputs=outputs, batch=batch)
 
         check_finite_tensor("val/mel_before", outputs["mel_before"])
         check_finite_tensor("val/mel_after", outputs["mel_after"])
@@ -580,9 +578,8 @@ def main() -> None:
     scaler = torch.amp.GradScaler(amp_device_type)
     criterion = Tacotron2Loss(
         gate_pos_weight=get_gate_pos_weight(),
-        gate_loss_weight=get_gate_loss_weight(),
+        guided_attn_weight=float(hp_get("guided_attn_weight_start", 2.0)),
         guided_attn_sigma=get_guided_attn_sigma(),
-        attention_entropy_weight=get_attention_entropy_weight(),
     ).to(device)
 
     guided_attn_scheduler = GuidedAttentionScheduler()
@@ -606,7 +603,6 @@ def main() -> None:
     print(f"Base LR           : {float(hp.lr):.2e}")
     print(f"Weight decay      : {get_weight_decay():.2e}")
     print(f"Clip grad norm    : {get_clip_grad_norm():.2f}")
-    print(f"Entropy loss w    : {get_attention_entropy_weight():.3e}")
     print(f"Seed              : {get_seed()}")
 
     writer.add_text("config/log_dir", str(log_dir), 0)
