@@ -7,7 +7,7 @@ from hyperparams_base import *
 epochs = 300
 lr = 1e-3
 
-batch_size = 64
+batch_size = 96
 num_workers = 32
 
 # =============================================================================
@@ -44,9 +44,8 @@ p_decoder_dropout = 0.1
 # Loss
 # =============================================================================
 
-guided_attn_weight = 1.0
+guided_attn_weight = 1.5
 guided_attn_sigma = 0.4
-gate_pos_weight = 5.0
 
 # =============================================================================
 # Attention metrics

@@ -17,6 +17,7 @@ import hyperparams_rnn as hp
 from tts_dataset import get_tacotron_dataset, collate_fn_tacotron
 from tts_rnn_model import Tacotron2
 from tts_tacotron_losses import Tacotron2Loss, sequence_mask
+
 from tts_seed import set_seed, seed_worker
 
 
@@ -51,7 +52,7 @@ def get_val_ratio() -> float:
 
 
 def get_guided_attn_weight() -> float:
-    return float(hp_get("guided_attn_weight", 1.0))
+    return float(hp_get("guided_attn_weight", 2.0))
 
 
 def get_guided_attn_sigma() -> float:
@@ -137,18 +138,59 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
-def adjust_learning_rate(
-    optimizer: torch.optim.Optimizer,
-    step_num: int,
-    warmup_step: int = 4000,
+def get_lr_warmup_epochs() -> int:
+    """
+    Epoch-based warmup length.
+
+    Historical equivalence for this project:
+        4000 optimizer steps ~= 20 epochs
+
+    Therefore, the default value is 20 epochs.
+    """
+    return int(hp_get("lr_warmup_epochs", 20))
+
+
+def get_lr_min() -> float:
+    return float(hp_get("lr_min", 1e-5))
+
+
+def get_lr_by_epoch(
+    epoch: int,
+    base_lr: float,
+    warmup_epochs: int = 20,
+    min_lr: float = 1e-5,
 ) -> float:
-    lr = hp.lr * (warmup_step ** 0.5) * min(
-        step_num * (warmup_step ** -1.5),
-        step_num ** -0.5,
+    """
+    Epoch-based analogue of the Noam/inverse-square-root schedule.
+
+    Args:
+        epoch: 0-based epoch index.
+        base_lr: peak/base learning rate from hyperparams.
+        warmup_epochs: number of warmup epochs.
+        min_lr: lower bound for LR.
+
+    Notes:
+        With warmup_epochs=20 this matches the old convention:
+        4000 optimizer steps ~= 20 epochs.
+
+        Formula:
+            lr = base_lr * min(e / W, sqrt(W / e))
+
+        where e = epoch + 1 and W = warmup_epochs.
+    """
+    e = max(int(epoch) + 1, 1)
+    W = max(int(warmup_epochs), 1)
+
+    lr = float(base_lr) * min(
+        e / float(W),
+        (float(W) / float(e)) ** 0.5,
     )
+    return max(float(lr), float(min_lr))
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for group in optimizer.param_groups:
-        group["lr"] = lr
-    return float(lr)
+        group["lr"] = float(lr)
 
 
 def average_metric_dict(metric_list: list[Dict[str, float]]) -> Dict[str, float]:
@@ -686,28 +728,38 @@ def main() -> None:
     print(f"Sample dir        : {sample_dir}")
     print(f"Optimizer         : Adam")
     print(f"Base LR           : {float(hp.lr):.2e}")
+    print(f"LR schedule       : epoch_noam_inverse_sqrt")
+    print(f"LR warmup epochs  : {get_lr_warmup_epochs()}")
+    print(f"LR min            : {get_lr_min():.2e}")
     print(f"Seed              : {seed}")
 
     writer.add_text("config/log_dir", str(log_dir), 0)
     writer.add_text("config/seed", str(seed), 0)
     writer.add_text("config/optimizer", "Adam", 0)
     writer.add_text("config/base_lr", f"{float(hp.lr):.6e}", 0)
+    writer.add_text("config/lr_schedule", "epoch_noam_inverse_sqrt", 0)
+    writer.add_text("config/lr_warmup_epochs", str(get_lr_warmup_epochs()), 0)
+    writer.add_text("config/lr_min", f"{get_lr_min():.6e}", 0)
 
     for epoch in range(start_epoch, hp.epochs):
         epoch_idx = epoch + 1
+
+        current_lr = get_lr_by_epoch(
+            epoch=epoch,
+            base_lr=float(hp.lr),
+            warmup_epochs=get_lr_warmup_epochs(),
+            min_lr=get_lr_min(),
+        )
+        set_optimizer_lr(optimizer, current_lr)
+
         model.train()
         pbar = tqdm(train_loader, desc=f"epoch {epoch_idx}/{int(hp.epochs)}")
         train_epoch_metrics: list[Dict[str, float]] = []
         last_outputs = None
-        current_lr = float(optimizer.param_groups[0]["lr"])
 
         for batch in pbar:
             global_step += 1
-
-            if global_step < 400000:
-                current_lr = adjust_learning_rate(optimizer, global_step)
-            else:
-                current_lr = float(optimizer.param_groups[0]["lr"])
+            current_lr = float(optimizer.param_groups[0]["lr"])
 
             outputs, metrics = train_one_step(
                 model=model,
