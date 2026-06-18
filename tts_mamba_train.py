@@ -122,6 +122,14 @@ def get_lr_warmup_epochs() -> int:
     return int(hp_get("lr_warmup_epochs", 20))
 
 
+def get_lr_step_epochs() -> int:
+    return int(hp_get("lr_step_epochs", 50))
+
+
+def get_lr_step_gamma() -> float:
+    return float(hp_get("lr_step_gamma", 0.5))
+
+
 def get_lr_hold_epochs() -> int:
     return int(hp_get("lr_hold_epochs", 0))
 
@@ -217,12 +225,31 @@ def get_lr_by_step(
 def get_lr_by_epoch(
     optimizer: torch.optim.Optimizer,
     epoch_num: int,
-    warmup_epoch: int = 20,
 ) -> float:
-    lr = hp.lr * (warmup_epoch ** 0.5) * min(
-        epoch_num * (warmup_epoch ** -1.5),
-        epoch_num ** -0.5,
-    )
+    """Linear warmup followed by epoch-based step decay."""
+    base_lr = float(hp.lr)
+    warmup_epochs = get_lr_warmup_epochs()
+    step_epochs = get_lr_step_epochs()
+    step_gamma = get_lr_step_gamma()
+    min_lr = get_lr_min()
+
+    if warmup_epochs < 0:
+        raise ValueError(f"lr_warmup_epochs must be >= 0, got {warmup_epochs}")
+    if step_epochs <= 0:
+        raise ValueError(f"lr_step_epochs must be > 0, got {step_epochs}")
+    if not 0.0 < step_gamma <= 1.0:
+        raise ValueError(f"lr_step_gamma must be in (0, 1], got {step_gamma}")
+    if min_lr < 0.0:
+        raise ValueError(f"lr_min must be >= 0, got {min_lr}")
+
+    epoch_num = max(1, int(epoch_num))
+    if warmup_epochs > 0 and epoch_num <= warmup_epochs:
+        lr = base_lr * epoch_num / warmup_epochs
+    else:
+        completed_steps = max(0, epoch_num - warmup_epochs) // step_epochs
+        lr = base_lr * (step_gamma ** completed_steps)
+
+    lr = max(min_lr, lr)
     for group in optimizer.param_groups:
         group["lr"] = lr
     return float(lr)
@@ -795,7 +822,12 @@ def main() -> None:
     print(f"Guided attn w     : {guided_attn_scheduler.start_value:.3f} -> {guided_attn_scheduler.end_value:.3f}")
     print(f"Guided attn sigma : {get_guided_attn_sigma():.3f}")
     print(f"Teacher forcing   : {teacher_forcing_scheduler.start_value:.3f} -> {teacher_forcing_scheduler.end_value:.3f}")
-    print(f"Noam warmup steps : {int(hp_get('warmup_step', 4000))}")
+    print(
+        "LR schedule       : "
+        f"linear warmup {get_lr_warmup_epochs()} epochs, "
+        f"then x{get_lr_step_gamma():.3f} every {get_lr_step_epochs()} epochs, "
+        f"min={get_lr_min():.2e}"
+    )
 
     for epoch in range(start_epoch, hp.epochs):
         model.train()
