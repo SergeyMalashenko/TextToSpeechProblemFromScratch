@@ -739,7 +739,16 @@ def main() -> None:
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(hp.lr))
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(hp.lr),
+        betas=(
+            float(hp_get("adam_beta1", 0.9)),
+            float(hp_get("adam_beta2", 0.999)),
+        ),
+        eps=float(hp_get("adam_eps", 1e-8)),
+        weight_decay=get_weight_decay(),
+    )
     scaler = torch.amp.GradScaler(amp_device_type)
 
     criterion = Tacotron2Loss(
@@ -773,8 +782,15 @@ def main() -> None:
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size  : {len(val_dataset)}")
     print(f"Log dir           : {log_dir}")
-    print(f"Optimizer         : Adam")
+    print(f"Optimizer         : AdamW")
     print(f"Base LR           : {float(hp.lr):.2e}")
+    print(
+        "AdamW parameters  : "
+        f"betas=({float(hp_get('adam_beta1', 0.9)):.3f}, "
+        f"{float(hp_get('adam_beta2', 0.999)):.3f}), "
+        f"eps={float(hp_get('adam_eps', 1e-8)):.1e}, "
+        f"weight_decay={get_weight_decay():.1e}"
+    )
     print(f"Clip grad norm    : {get_clip_grad_norm():.2f}")
     print(f"Guided attn w     : {guided_attn_scheduler.start_value:.3f} -> {guided_attn_scheduler.end_value:.3f}")
     print(f"Guided attn sigma : {get_guided_attn_sigma():.3f}")
