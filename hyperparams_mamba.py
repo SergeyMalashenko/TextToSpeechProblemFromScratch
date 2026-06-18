@@ -52,10 +52,11 @@ mamba_d_conv = 4
 mamba_expand = 2
 mamba_dropout = 0.1
 
-# Cross-attention from mel-time decoder states to encoded text memory.
-# The model applies a forward monotonic recurrence to the content attention:
-# each mel frame may stay on the current symbol or advance by one symbol.
-mamba_attention_heads = 4
+# Location-sensitive cross-attention copied from the RNN Tacotron2 design.
+# It combines content scores with previous and cumulative alignment maps.
+mamba_attention_dim = 128
+mamba_attention_location_filters = 32
+mamba_attention_location_kernel_size = 31
 
 # Tacotron-style mel prenet before the Mamba decoder.
 mamba_prenet_hidden = 256

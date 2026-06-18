@@ -56,8 +56,9 @@ class Prenet(nn.Module):
         self.dropout = float(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Tacotron-style prenet dropout is useful during training. During eval we
-        # use standard deterministic behavior.
+        # Unlike the step-wise RNN decoder, Mamba recomputes the full generated
+        # prefix at inference. Keep eval deterministic so historical decoder
+        # states do not change randomly between generation steps.
         for layer in self.layers:
             x = F.relu(layer(x))
             x = F.dropout(x, p=self.dropout, training=self.training)
@@ -137,48 +138,70 @@ class SinusoidalPositionEncoding(nn.Module):
         return x + encoding.to(dtype=x.dtype).unsqueeze(0)
 
 
-class CrossAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1) -> None:
+class LocationLayer(nn.Module):
+    def __init__(
+        self,
+        attention_dim: int,
+        n_filters: int,
+        kernel_size: int,
+    ) -> None:
         super().__init__()
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
+        padding = (kernel_size - 1) // 2
+        self.location_conv = nn.Conv1d(
+            in_channels=2,
+            out_channels=n_filters,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=False,
         )
+        self.location_dense = nn.Linear(n_filters, attention_dim, bias=False)
+
+    def forward(self, attention_weights_cat: torch.Tensor) -> torch.Tensor:
+        processed = self.location_conv(attention_weights_cat)
+        return self.location_dense(processed.transpose(1, 2))
+
+
+class CrossAttention(nn.Module):
+    """
+    RNN Tacotron2-style location-sensitive attention.
+
+    Mamba decoder states replace the RNN attention hidden state, while the
+    previous and cumulative alignment maps are updated exactly as in the RNN
+    decoder.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        attention_dim: int = 128,
+        location_filters: int = 32,
+        location_kernel_size: int = 31,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.query_layer = nn.Linear(d_model, attention_dim, bias=False)
+        self.memory_layer = nn.Linear(d_model, attention_dim, bias=False)
+        self.v = nn.Linear(attention_dim, 1, bias=False)
+        self.location_layer = LocationLayer(
+            attention_dim=attention_dim,
+            n_filters=location_filters,
+            kernel_size=location_kernel_size,
+        )
+        self.context_projection = nn.Linear(d_model * 2, d_model)
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    @staticmethod
-    def _forward_attention(
-        energies: torch.Tensor,
-        valid_memory: torch.Tensor,
+    def get_alignment_energies(
+        self,
+        query: torch.Tensor,
+        processed_memory: torch.Tensor,
+        attention_weights_cat: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Convert content attention into a monotonic forward path.
-
-        At every decoder step attention may stay on the current text position
-        or advance by one position. It cannot jump backwards.
-        """
-        content_weights = torch.softmax(
-            energies.masked_fill(~valid_memory[:, None, None, :], torch.finfo(energies.dtype).min),
-            dim=-1,
-        )
-
-        B, H, T_mel, T_text = content_weights.shape
-        previous = content_weights.new_zeros(B, H, T_text)
-        previous[:, :, 0] = 1.0
-        alignments = []
-
-        for t in range(T_mel):
-            stay_or_advance = previous + F.pad(previous[:, :, :-1], (1, 0))
-            current = content_weights[:, :, t, :] * stay_or_advance
-            current = current * valid_memory[:, None, :].to(current.dtype)
-            current = current / current.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(current.dtype).tiny)
-            alignments.append(current)
-            previous = current
-
-        return torch.stack(alignments, dim=2)
+        processed_query = self.query_layer(query).unsqueeze(1)
+        processed_attention = self.location_layer(attention_weights_cat)
+        return self.v(
+            torch.tanh(processed_query + processed_attention + processed_memory)
+        ).squeeze(-1)
 
     def forward(
         self,
@@ -188,31 +211,41 @@ class CrossAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # query:  (B, T_mel, D)
         # memory: (B, T_text, D)
-        B, T_mel, D = query.shape
+        B, T_mel, _ = query.shape
         T_text = memory.size(1)
-        H = self.attn.num_heads
-        head_dim = D // H
+        processed_memory = self.memory_layer(memory)
+        invalid_memory = ~LengthMask.make(memory_lengths, max_len=T_text)
 
-        q_weight, k_weight, v_weight = self.attn.in_proj_weight.chunk(3, dim=0)
-        if self.attn.in_proj_bias is None:
-            q_bias = k_bias = v_bias = None
-        else:
-            q_bias, k_bias, v_bias = self.attn.in_proj_bias.chunk(3, dim=0)
+        attention_weights = memory.new_zeros(B, T_text)
+        attention_weights_cum = memory.new_zeros(B, T_text)
+        contexts = []
+        alignments = []
 
-        q = F.linear(query, q_weight, q_bias).view(B, T_mel, H, head_dim).transpose(1, 2)
-        k = F.linear(memory, k_weight, k_bias).view(B, T_text, H, head_dim).transpose(1, 2)
-        v = F.linear(memory, v_weight, v_bias).view(B, T_text, H, head_dim).transpose(1, 2)
+        for t in range(T_mel):
+            attention_weights_cat = torch.stack(
+                [attention_weights, attention_weights_cum],
+                dim=1,
+            )
+            energies = self.get_alignment_energies(
+                query=query[:, t, :],
+                processed_memory=processed_memory,
+                attention_weights_cat=attention_weights_cat,
+            )
+            energies = energies.masked_fill(invalid_memory, -float("inf"))
+            attention_weights = F.softmax(energies, dim=1)
+            attention_weights_cum = attention_weights_cum + attention_weights
+            context = torch.bmm(attention_weights.unsqueeze(1), memory).squeeze(1)
 
-        energies = torch.matmul(q, k.transpose(-2, -1)) * (head_dim ** -0.5)
-        valid_memory = LengthMask.make(memory_lengths, max_len=T_text)
-        head_weights = self._forward_attention(energies, valid_memory)
-        context = torch.matmul(head_weights, v)
-        context = context.transpose(1, 2).contiguous().view(B, T_mel, D)
-        context = self.attn.out_proj(context)
+            contexts.append(context)
+            alignments.append(attention_weights)
 
-        x = self.norm(query + self.dropout(context))
-        weights = head_weights.mean(dim=1)
-        return x, weights
+        context_sequence = torch.stack(contexts, dim=1)
+        alignment_sequence = torch.stack(alignments, dim=1)
+        x = self.context_projection(
+            torch.cat([query, self.dropout(context_sequence)], dim=-1)
+        )
+        x = self.norm(x)
+        return x, alignment_sequence
 
 
 class Postnet(nn.Module):
@@ -248,7 +281,6 @@ class MambaTacotron2(nn.Module):
         d_state: Optional[int] = None,
         d_conv: Optional[int] = None,
         expand: Optional[int] = None,
-        n_heads: Optional[int] = None,
         dropout: Optional[float] = None,
         max_decoder_steps: Optional[int] = None,
         gate_threshold: Optional[float] = None,
@@ -266,7 +298,6 @@ class MambaTacotron2(nn.Module):
         d_state = int(d_state if d_state is not None else hp_get("mamba_d_state", 16))
         d_conv = int(d_conv if d_conv is not None else hp_get("mamba_d_conv", 4))
         expand = int(expand if expand is not None else hp_get("mamba_expand", 2))
-        n_heads = int(n_heads if n_heads is not None else hp_get("mamba_attention_heads", 4))
         dropout = float(dropout if dropout is not None else hp_get("mamba_dropout", 0.1))
 
         self.embedding = nn.Embedding(self.n_symbols, self.d_model, padding_idx=0)
@@ -294,7 +325,13 @@ class MambaTacotron2(nn.Module):
             expand=expand,
             dropout=dropout,
         )
-        self.cross_attn = CrossAttention(self.d_model, n_heads=n_heads, dropout=dropout)
+        self.cross_attn = CrossAttention(
+            d_model=self.d_model,
+            attention_dim=int(hp_get("mamba_attention_dim", 128)),
+            location_filters=int(hp_get("mamba_attention_location_filters", 32)),
+            location_kernel_size=int(hp_get("mamba_attention_location_kernel_size", 31)),
+            dropout=dropout,
+        )
         self.fusion = nn.Sequential(
             nn.Linear(self.d_model, self.d_model * 2),
             nn.GELU(),
