@@ -273,19 +273,33 @@ class MambaTacotron2(nn.Module):
         text_lengths: torch.Tensor,
         mel_input: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        x = self.prenet(mel_input)
-        x = self.decoder(x)
-        x, alignments = self.cross_attn(x, memory, text_lengths)
-        x = self.fusion(x)
-        mel_before = self.mel_proj(x)
+        mel_before, gate, alignments = self.decode_sequence(
+            memory=memory,
+            text_lengths=text_lengths,
+            mel_input=mel_input,
+        )
         mel_after = self.postnet(mel_before)
-        gate = self.gate_proj(x).squeeze(-1)
         return {
             "mel_before": mel_before,
             "mel_after": mel_after,
             "gate": gate,
             "alignments": alignments,
         }
+
+    def decode_sequence(
+        self,
+        memory: torch.Tensor,
+        text_lengths: torch.Tensor,
+        mel_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode a mel prefix without running the non-causal postnet."""
+        x = self.prenet(mel_input)
+        x = self.decoder(x)
+        x, alignments = self.cross_attn(x, memory, text_lengths)
+        x = self.fusion(x)
+        mel_before = self.mel_proj(x)
+        gate = self.gate_proj(x).squeeze(-1)
+        return mel_before, gate, alignments
 
     def build_scheduled_mel_input(
         self,
@@ -369,35 +383,53 @@ class MambaTacotron2(nn.Module):
         return self.decode_teacher_forced(memory, text_lengths, mel_input)
 
     @torch.no_grad()
-    def inference(self, text: torch.Tensor, text_lengths: torch.Tensor) -> Dict[str, torch.Tensor]:
-        self.eval()
+    def inference(
+        self,
+        text: torch.Tensor,
+        text_lengths: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if text_lengths is None:
+            text_lengths = torch.full(
+                (text.size(0),),
+                fill_value=text.size(1),
+                dtype=torch.long,
+                device=text.device,
+            )
+
         memory = self.encode(text, text_lengths)
         B = text.size(0)
-        assert B == 1, "Current simple autoregressive inference supports batch size 1."
 
         mel_before_frames = []
-        mel_after_frames = []
         gates = []
         aligns = []
-        prev = torch.zeros(B, 1, self.n_mels, device=text.device, dtype=memory.dtype)
+        # Same decoder contract as RNN Tacotron2:
+        # input[0] is GO, input[t] is the raw mel prediction from step t - 1.
+        decoder_inputs = memory.new_zeros(B, 1, self.n_mels)
 
         for _ in range(self.max_decoder_steps):
-            mel_input = torch.cat(mel_before_frames + [prev], dim=1) if mel_before_frames else prev
-            out = self.decode_teacher_forced(memory, text_lengths, mel_input)
-            next_mel_before = out["mel_before"][:, -1:, :]
-            next_mel_after = out["mel_after"][:, -1:, :]
-            next_gate = out["gate"][:, -1:]
-            next_align = out["alignments"][:, -1:, :]
+            mel_sequence, gate_sequence, alignment_sequence = self.decode_sequence(
+                memory=memory,
+                text_lengths=text_lengths,
+                mel_input=decoder_inputs,
+            )
+            next_mel_before = mel_sequence[:, -1:, :]
+            next_gate = gate_sequence[:, -1:]
+            next_align = alignment_sequence[:, -1:, :]
+
             mel_before_frames.append(next_mel_before)
-            mel_after_frames.append(next_mel_after)
             gates.append(next_gate)
             aligns.append(next_align)
-            prev = next_mel_before
-            if torch.sigmoid(next_gate).item() > self.gate_threshold and len(mel_before_frames) > 5:
+
+            if torch.sigmoid(next_gate).max().item() > self.gate_threshold:
                 break
 
+            decoder_inputs = torch.cat([decoder_inputs, next_mel_before], dim=1)
+
         mel_before = torch.cat(mel_before_frames, dim=1)
-        mel_after = torch.cat(mel_after_frames, dim=1)
+        # Tacotron2 postnet sees the complete generated sequence once. Running it
+        # on every prefix would make stored early frames inconsistent because
+        # its convolutions use neighboring frames in both directions.
+        mel_after = self.postnet(mel_before)
         gate = torch.cat(gates, dim=1)
         alignments = torch.cat(aligns, dim=1)
         return {
