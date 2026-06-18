@@ -81,7 +81,7 @@ gate_pos_weight = 5.0
 # Scheduled guided attention.
 # First, strong diagonal pressure helps alignment form. Later, the pressure is
 # reduced so the acoustic model can refine timing and prosody.
-guided_attn_weight_start = 2.0
+guided_attn_weight_start = 1.0
 guided_attn_weight_end = 0.01
 guided_attn_decay_start_epoch = 150
 guided_attn_decay_end_epoch = 200
