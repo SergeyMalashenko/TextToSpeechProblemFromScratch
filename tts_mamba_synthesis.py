@@ -235,7 +235,8 @@ def resolve_mel2mag_checkpoint(arg_value: str | None) -> Path:
     step = hp_get("restore_step2", None)
     if step is None:
         raise ValueError("MelToMag checkpoint is not provided. Use --mel2mag_ckpt.")
-    return Path(hp.checkpoint_path) / f"checkpoint_mel2mag_{step}.pth.tar"
+    checkpoint_dir = Path(hp_get("mel2mag_checkpoint_path", "./checkpoint"))
+    return checkpoint_dir / f"checkpoint_mel2mag_{step}.pth.tar"
 
 
 def resolve_vocoder_checkpoint(arg_value: str | None) -> Path:
