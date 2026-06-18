@@ -669,6 +669,38 @@ def train_one_step(
 
 
 @torch.no_grad()
+def compute_autoregressive_metrics(
+    model: nn.Module,
+    batch: Dict[str, torch.Tensor],
+) -> Dict[str, float]:
+    model_w = unwrap_model(model)
+    text = batch["text"][:1]
+    text_lengths = batch["text_lengths"][:1]
+    target_frames = int(batch["output_lengths"][0].item())
+
+    outputs = model_w.inference(text=text, text_lengths=text_lengths)
+    alignments = outputs["alignments"][0]
+    gate = outputs["gate"][0]
+    generated_frames = int(alignments.size(0))
+    text_length = int(text_lengths[0].item())
+
+    valid_alignments = alignments[:, :text_length]
+    positions = valid_alignments.argmax(dim=-1)
+    backward_jumps = (positions[1:] < positions[:-1]).float().mean() if positions.numel() > 1 else positions.new_tensor(0.0)
+    final_position = int(positions[-1].item()) if positions.numel() > 0 else 0
+    coverage = (final_position + 1) / max(1, text_length)
+
+    return {
+        "ar_generated_frames": float(generated_frames),
+        "ar_target_frames": float(target_frames),
+        "ar_length_ratio": float(generated_frames / max(1, target_frames)),
+        "ar_gate_last_prob": float(torch.sigmoid(gate[-1]).item()) if gate.numel() > 0 else 0.0,
+        "ar_text_coverage": float(coverage),
+        "ar_backward_jump_rate": float(backward_jumps.item()),
+    }
+
+
+@torch.no_grad()
 def validate(
     model: nn.Module,
     criterion: Tacotron2Loss,
@@ -681,9 +713,12 @@ def validate(
     set_guided_attn_weight(criterion, guided_attn_weight)
     totals = defaultdict(float)
     n_batches = 0
+    autoregressive_batch = None
 
     for batch in tqdm(dataloader, desc="validation", leave=False):
         batch = move_batch_to_device(batch, device)
+        if autoregressive_batch is None:
+            autoregressive_batch = batch
         with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
             outputs = model(
                 text=batch["text"],
@@ -719,10 +754,16 @@ def validate(
             totals[key] += float(value)
         n_batches += 1
 
-    model.train()
     if n_batches == 0:
+        model.train()
         return {"loss": 0.0}
-    return {key: value / n_batches for key, value in totals.items()}
+
+    metrics = {key: value / n_batches for key, value in totals.items()}
+    if autoregressive_batch is not None:
+        metrics.update(compute_autoregressive_metrics(model, autoregressive_batch))
+
+    model.train()
+    return metrics
 
 
 # =============================================================================
@@ -919,7 +960,10 @@ def main() -> None:
                 f"melE={val_stats['mel_after_energy']:.4f} "
                 f"gaw={val_stats['guided_attn_weight']:.3f} "
                 f"tf={val_stats['teacher_forcing_ratio']:.3f} "
-                f"acc={val_stats['accuracy']:.4f}"
+                f"acc={val_stats['accuracy']:.4f} "
+                f"ar_len={val_stats['ar_length_ratio']:.3f} "
+                f"ar_cov={val_stats['ar_text_coverage']:.3f} "
+                f"ar_back={val_stats['ar_backward_jump_rate']:.3f}"
             )
             for key, value in val_stats.items():
                 writer.add_scalar(f"val/{key}", value, epoch_index)

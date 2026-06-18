@@ -120,6 +120,23 @@ class MambaStack(nn.Module):
         return self.final_norm(x)
 
 
+class SinusoidalPositionEncoding(nn.Module):
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.d_model = int(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(x.size(1), device=x.device, dtype=torch.float32).unsqueeze(1)
+        even_dims = torch.arange(0, self.d_model, 2, device=x.device, dtype=torch.float32)
+        angles = positions * torch.exp(-torch.log(x.new_tensor(10000.0).float()) * even_dims / self.d_model)
+
+        encoding = torch.zeros(x.size(1), self.d_model, device=x.device, dtype=torch.float32)
+        encoding[:, 0::2] = torch.sin(angles)
+        if self.d_model > 1:
+            encoding[:, 1::2] = torch.cos(angles[:, : encoding[:, 1::2].size(1)])
+        return x + encoding.to(dtype=x.dtype).unsqueeze(0)
+
+
 class CrossAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1) -> None:
         super().__init__()
@@ -132,6 +149,37 @@ class CrossAttention(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
+    @staticmethod
+    def _forward_attention(
+        energies: torch.Tensor,
+        valid_memory: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Convert content attention into a monotonic forward path.
+
+        At every decoder step attention may stay on the current text position
+        or advance by one position. It cannot jump backwards.
+        """
+        content_weights = torch.softmax(
+            energies.masked_fill(~valid_memory[:, None, None, :], torch.finfo(energies.dtype).min),
+            dim=-1,
+        )
+
+        B, H, T_mel, T_text = content_weights.shape
+        previous = content_weights.new_zeros(B, H, T_text)
+        previous[:, :, 0] = 1.0
+        alignments = []
+
+        for t in range(T_mel):
+            stay_or_advance = previous + F.pad(previous[:, :, :-1], (1, 0))
+            current = content_weights[:, :, t, :] * stay_or_advance
+            current = current * valid_memory[:, None, :].to(current.dtype)
+            current = current / current.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(current.dtype).tiny)
+            alignments.append(current)
+            previous = current
+
+        return torch.stack(alignments, dim=2)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -140,17 +188,30 @@ class CrossAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # query:  (B, T_mel, D)
         # memory: (B, T_text, D)
-        key_padding_mask = ~LengthMask.make(memory_lengths, max_len=memory.size(1))
-        context, weights = self.attn(
-            query=query,
-            key=memory,
-            value=memory,
-            key_padding_mask=key_padding_mask,
-            need_weights=True,
-            average_attn_weights=True,
-        )
+        B, T_mel, D = query.shape
+        T_text = memory.size(1)
+        H = self.attn.num_heads
+        head_dim = D // H
+
+        q_weight, k_weight, v_weight = self.attn.in_proj_weight.chunk(3, dim=0)
+        if self.attn.in_proj_bias is None:
+            q_bias = k_bias = v_bias = None
+        else:
+            q_bias, k_bias, v_bias = self.attn.in_proj_bias.chunk(3, dim=0)
+
+        q = F.linear(query, q_weight, q_bias).view(B, T_mel, H, head_dim).transpose(1, 2)
+        k = F.linear(memory, k_weight, k_bias).view(B, T_text, H, head_dim).transpose(1, 2)
+        v = F.linear(memory, v_weight, v_bias).view(B, T_text, H, head_dim).transpose(1, 2)
+
+        energies = torch.matmul(q, k.transpose(-2, -1)) * (head_dim ** -0.5)
+        valid_memory = LengthMask.make(memory_lengths, max_len=T_text)
+        head_weights = self._forward_attention(energies, valid_memory)
+        context = torch.matmul(head_weights, v)
+        context = context.transpose(1, 2).contiguous().view(B, T_mel, D)
+        context = self.attn.out_proj(context)
+
         x = self.norm(query + self.dropout(context))
-        # weights: (B, T_mel, T_text)
+        weights = head_weights.mean(dim=1)
         return x, weights
 
 
@@ -209,6 +270,8 @@ class MambaTacotron2(nn.Module):
         dropout = float(dropout if dropout is not None else hp_get("mamba_dropout", 0.1))
 
         self.embedding = nn.Embedding(self.n_symbols, self.d_model, padding_idx=0)
+        self.text_position = SinusoidalPositionEncoding(self.d_model)
+        self.mel_position = SinusoidalPositionEncoding(self.d_model)
         self.encoder = MambaStack(
             d_model=self.d_model,
             n_layers=enc_layers,
@@ -263,6 +326,7 @@ class MambaTacotron2(nn.Module):
 
     def encode(self, text: torch.Tensor, text_lengths: torch.Tensor) -> torch.Tensor:
         x = self.embedding(text)
+        x = self.text_position(x)
         x = self.encoder(x)
         mask = LengthMask.make(text_lengths, max_len=x.size(1)).unsqueeze(-1).to(x.dtype)
         return x * mask
@@ -294,6 +358,7 @@ class MambaTacotron2(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode a mel prefix without running the non-causal postnet."""
         x = self.prenet(mel_input)
+        x = self.mel_position(x)
         x = self.decoder(x)
         x, alignments = self.cross_attn(x, memory, text_lengths)
         x = self.fusion(x)

@@ -53,6 +53,8 @@ mamba_expand = 2
 mamba_dropout = 0.1
 
 # Cross-attention from mel-time decoder states to encoded text memory.
+# The model applies a forward monotonic recurrence to the content attention:
+# each mel frame may stay on the current symbol or advance by one symbol.
 mamba_attention_heads = 4
 
 # Tacotron-style mel prenet before the Mamba decoder.
@@ -79,21 +81,21 @@ gate_threshold = 0.5
 gate_pos_weight = 5.0
 
 # Scheduled guided attention.
-# First, strong diagonal pressure helps alignment form. Later, the pressure is
-# reduced so the acoustic model can refine timing and prosody.
+# Keep diagonal pressure while teacher forcing is being reduced. Only relax it
+# after the model has spent substantial time consuming its own predictions.
 guided_attn_weight_start = 1.0
-guided_attn_weight_end = 0.01
-guided_attn_decay_start_epoch = 150
-guided_attn_decay_end_epoch = 200
+guided_attn_weight_end = 0.1
+guided_attn_decay_start_epoch = 250
+guided_attn_decay_end_epoch = 350
 guided_attn_sigma = 0.2
 
 # Scheduled teacher forcing.
-# During LR warmup the model receives full ground-truth mel input.
-# After warmup, the ratio linearly decays to teacher_forcing_end.
+# Start exposing the model to its own predictions after the initial alignment
+# warmup, well before guided attention is relaxed.
 teacher_forcing_start = 1.0
 teacher_forcing_end = 0.2
-teacher_forcing_decay_start_epoch = 200
-teacher_forcing_decay_end_epoch = epochs
+teacher_forcing_decay_start_epoch = 50
+teacher_forcing_decay_end_epoch = 250
 
 # =============================================================================
 # Optimizer / regularization
