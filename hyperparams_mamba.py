@@ -95,8 +95,8 @@ guided_attn_sigma = 0.2
 # warmup, well before guided attention is relaxed.
 teacher_forcing_start = 1.0
 teacher_forcing_end = 0.2
-teacher_forcing_decay_start_epoch = 50
-teacher_forcing_decay_end_epoch = 250
+teacher_forcing_decay_start_epoch = 150
+teacher_forcing_decay_end_epoch = 350
 
 # =============================================================================
 # Optimizer / regularization
