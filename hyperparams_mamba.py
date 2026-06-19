@@ -84,19 +84,19 @@ gate_pos_weight = 5.0
 # Scheduled guided attention.
 # Keep diagonal pressure while teacher forcing is being reduced. Only relax it
 # after the model has spent substantial time consuming its own predictions.
-guided_attn_weight_start = 1.0
-guided_attn_weight_end = 0.1
+guided_attn_weight_start = 2.0
+guided_attn_weight_end = 0.5
 guided_attn_decay_start_epoch = 250
-guided_attn_decay_end_epoch = 350
-guided_attn_sigma = 0.2
+guided_attn_decay_end_epoch = 400
+guided_attn_sigma = 0.30
 
 # Scheduled teacher forcing.
 # Start exposing the model to its own predictions after the initial alignment
 # warmup, well before guided attention is relaxed.
 teacher_forcing_start = 1.0
-teacher_forcing_end = 0.2
-teacher_forcing_decay_start_epoch = 150
-teacher_forcing_decay_end_epoch = 350
+teacher_forcing_end = 0.4
+teacher_forcing_decay_start_epoch = 100
+teacher_forcing_decay_end_epoch = 300
 
 # =============================================================================
 # Optimizer / regularization
