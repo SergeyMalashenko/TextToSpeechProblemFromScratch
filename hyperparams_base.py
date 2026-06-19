@@ -47,6 +47,7 @@ num_workers = 32
 val_ratio = 0.02
 
 max_checkpoints_to_keep = 5
+experiment_name = ""
 
 
 # =============================================================================

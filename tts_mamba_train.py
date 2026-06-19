@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -84,6 +85,38 @@ def get_checkpoint_dir() -> Path:
 
 def get_log_dir() -> Path:
     return Path(hp_get("mamba_log_dir", "./logs/mamba_tacotron"))
+
+
+def _safe_experiment_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        return ""
+    safe_chars = []
+    for ch in name:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe_chars.append(ch)
+        else:
+            safe_chars.append("_")
+    return "".join(safe_chars).strip("_")
+
+
+def create_experiment_log_dir(base_dir: str | Path, prefix: str) -> Path:
+    base_dir = Path(base_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment_name = _safe_experiment_name(str(hp_get("experiment_name", "")))
+
+    run_name = f"{prefix}_{timestamp}"
+    if experiment_name:
+        run_name = f"{run_name}_{experiment_name}"
+
+    run_dir = base_dir / run_name
+    suffix = 1
+    while run_dir.exists():
+        run_dir = base_dir / f"{run_name}_{suffix:02d}"
+        suffix += 1
+
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
 
 
 def get_samples_dir() -> Path:
@@ -828,8 +861,7 @@ def main() -> None:
     guided_attn_scheduler = GuidedAttentionScheduler()
     teacher_forcing_scheduler = TeacherForcingScheduler()
 
-    log_dir = get_log_dir()
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = create_experiment_log_dir(get_log_dir(), prefix="mamba")
     writer = SummaryWriter(log_dir=str(log_dir))
 
     resume_path = hp_get("resume_mamba_checkpoint", hp_get("resume_rnn_tacotron_path", None))
