@@ -311,6 +311,18 @@ class MambaTacotron2(nn.Module):
             expand=expand,
             dropout=dropout,
         )
+        self.encoder_rev = MambaStack(
+            d_model=self.d_model,
+            n_layers=enc_layers,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            dropout=dropout,
+        )
+        self.encoder_projection = nn.Sequential(
+            nn.Linear(self.d_model * 2, self.d_model),
+            nn.LayerNorm(self.d_model),
+        )
         self.prenet = Prenet(
             in_dim=self.n_mels,
             hidden_dim=int(hp_get("mamba_prenet_hidden", 256)),
@@ -360,11 +372,18 @@ class MambaTacotron2(nn.Module):
         nn.init.zeros_(self.mel_proj.bias)
         nn.init.xavier_uniform_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, -3.0)
+        for module in self.encoder_projection:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
 
     def encode(self, text: torch.Tensor, text_lengths: torch.Tensor) -> torch.Tensor:
         x = self.embedding(text)
         x = self.text_position(x)
-        x = self.encoder(x)
+        x_fwd = self.encoder(x)
+        x_bwd = self.encoder_rev(torch.flip(x, dims=(1,)))
+        x_bwd = torch.flip(x_bwd, dims=(1,))
+        x = self.encoder_projection(torch.cat([x_fwd, x_bwd], dim=-1))
         mask = LengthMask.make(text_lengths, max_len=x.size(1)).unsqueeze(-1).to(x.dtype)
         return x * mask
 
