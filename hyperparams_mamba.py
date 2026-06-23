@@ -11,7 +11,7 @@ from hyperparams_base import *
 # Training
 # =============================================================================
 
-epochs = 400
+epochs = 500
 lr = 5e-4
 
 # Mamba/Transformer-style sequence models are usually more stable with a lower
@@ -28,7 +28,7 @@ seed = 42
 # DataLoader
 # =============================================================================
 
-use_bucket_sampler = True
+use_bucket_sampler = False
 bucket_size_multiplier = 20
 bucket_drop_last = False
 
@@ -85,18 +85,18 @@ gate_pos_weight = 5.0
 # Keep diagonal pressure while teacher forcing is being reduced. Only relax it
 # after the model has spent substantial time consuming its own predictions.
 guided_attn_weight_start = 2.0
-guided_attn_weight_end = 0.5
-guided_attn_decay_start_epoch = 250
+guided_attn_weight_end = 0.1
+guided_attn_decay_start_epoch = 200
 guided_attn_decay_end_epoch = 400
-guided_attn_sigma = 0.30
+guided_attn_sigma = 0.40
 
 # Scheduled teacher forcing.
 # Start exposing the model to its own predictions after the initial alignment
 # warmup, well before guided attention is relaxed.
 teacher_forcing_start = 1.0
 teacher_forcing_end = 0.4
-teacher_forcing_decay_start_epoch = 100
-teacher_forcing_decay_end_epoch = 300
+teacher_forcing_decay_start_epoch = 300
+teacher_forcing_decay_end_epoch = 500
 
 # =============================================================================
 # Optimizer / regularization
@@ -117,7 +117,7 @@ clip_grad_norm = 1.0
 #   3. lr is clipped by lr_min.
 
 lr_warmup_epochs = 50
-lr_step_epochs = 50
+lr_step_epochs = 75
 lr_step_gamma = 0.5
 lr_min = 1e-5
 
