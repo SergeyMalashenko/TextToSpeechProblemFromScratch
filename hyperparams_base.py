@@ -55,17 +55,27 @@ experiment_name = ""
 # =============================================================================
 
 data_path = "./data/LJSpeech-1.1"
-checkpoint_path = "./checkpoint"
-sample_path = "./samples"
 
-logs_root = "./logs"
-rnn_log_dir = "./logs/rnn_tacotron"
-transformer_log_dir = "./logs/transformer_tacotron"
+# Unified output directory structure
+outputs_root = "./outputs"
+checkpoint_root = "./outputs/checkpoints"
+logs_root = "./outputs/logs"
+synthesis_root = "./outputs/synthesis"
 
-simple_vocoder_checkpoint_path = "./checkpoint_vocoder"
-hifigan_checkpoint_path = "./checkpoint_hifigan"
+# Acoustic model checkpoints
+checkpoint_path = "./outputs/checkpoints/rnn"
 
-mel2mag_log_dir = "./logs/mel2mag"
+# Acoustic model logs
+rnn_log_dir = "./outputs/logs/rnn"
+transformer_log_dir = "./outputs/logs/transformer"
+mel2mag_log_dir = "./outputs/logs/mel2mag"
+
+# Synthesis samples
+sample_path = "./outputs/synthesis/rnn"
+
+# Vocoder checkpoints
+simple_vocoder_checkpoint_path = "./outputs/checkpoints/vocoder_simple"
+hifigan_checkpoint_path = "./outputs/checkpoints/vocoder_hifigan"
 
 # =============================================================================
 # Unified synthesis defaults

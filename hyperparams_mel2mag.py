@@ -13,4 +13,4 @@ mel2mag_dropout = 0.5
 resume_mel2mag_checkpoint = None
 restore_step2 = None
 
-log_dir = mel2mag_log_dir
+log_dir = "./outputs/logs/mel2mag"

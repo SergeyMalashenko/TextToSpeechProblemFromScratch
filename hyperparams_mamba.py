@@ -145,11 +145,7 @@ image_every_epoch = log_alignment_every_epoch
 # Output paths
 # =============================================================================
 
-mamba_log_dir = "./logs/mamba_tacotron"
-log_dir = mamba_log_dir
-
-# If hyperparams_base.py already defines checkpoint_path/sample_path, these
-# assignments create Mamba-specific subfolders under the same root.
-checkpoint_path = "./checkpoint/mamba_tacotron"
-sample_path = "./samples/mamba_tacotron"
+checkpoint_path = "./outputs/checkpoints/mamba"
+sample_path = "./outputs/synthesis/mamba"
+log_dir = "./outputs/logs/mamba"
 max_checkpoints_to_keep = 5

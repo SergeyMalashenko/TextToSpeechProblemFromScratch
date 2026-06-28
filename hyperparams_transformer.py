@@ -121,4 +121,6 @@ restore_transformer_epoch = None
 # Logging
 # =============================================================================
 
-log_dir = transformer_log_dir
+checkpoint_path = "./outputs/checkpoints/transformer"
+sample_path = "./outputs/synthesis/transformer"
+log_dir = "./outputs/logs/transformer"
