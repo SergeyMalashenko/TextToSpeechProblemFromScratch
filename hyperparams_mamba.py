@@ -21,7 +21,7 @@ lr = 6e-4
 batch_size = 48
 num_workers = 32
 pin_memory = True
-val_ratio = 0.02
+val_ratio = 0.05
 seed = 42
 
 # =============================================================================
@@ -50,7 +50,7 @@ mamba_decoder_layers = 4
 mamba_d_state = 16
 mamba_d_conv = 4
 mamba_expand = 2
-mamba_dropout = 0.1
+mamba_dropout = 0.2
 
 # Location-sensitive cross-attention copied from the RNN Tacotron2 design.
 # It combines content scores with previous and cumulative alignment maps.
@@ -105,7 +105,7 @@ teacher_forcing_decay_end_epoch = 500
 adam_beta1 = 0.9
 adam_beta2 = 0.98
 adam_eps = 1e-9
-weight_decay = 1e-4
+weight_decay = 5e-4
 clip_grad_norm = 1.0
 
 # =============================================================================
