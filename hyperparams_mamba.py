@@ -12,7 +12,7 @@ from hyperparams_base import *
 # =============================================================================
 
 epochs = 500
-lr = 5e-4
+lr = 6e-4
 
 # Mamba/Transformer-style sequence models are usually more stable with a lower
 # LR than the original RNN Tacotron setting. Start here; increase only after the
@@ -79,13 +79,13 @@ gate_threshold = 0.5
 # The Mamba model still uses Tacotron-style losses:
 #   total = mel_loss + gate_loss + guided_attn_weight * attn_loss
 
-gate_pos_weight = 5.0
+gate_pos_weight = 2.0
 
 # Scheduled guided attention.
 # Keep diagonal pressure while teacher forcing is being reduced. Only relax it
 # after the model has spent substantial time consuming its own predictions.
-guided_attn_weight_start = 2.0
-guided_attn_weight_end = 0.1
+guided_attn_weight_start = 1.0
+guided_attn_weight_end = 1.0
 guided_attn_decay_start_epoch = 200
 guided_attn_decay_end_epoch = 400
 guided_attn_sigma = 0.40
@@ -94,7 +94,7 @@ guided_attn_sigma = 0.40
 # Start exposing the model to its own predictions after the initial alignment
 # warmup, well before guided attention is relaxed.
 teacher_forcing_start = 1.0
-teacher_forcing_end = 0.4
+teacher_forcing_end = 1.0
 teacher_forcing_decay_start_epoch = 300
 teacher_forcing_decay_end_epoch = 500
 
