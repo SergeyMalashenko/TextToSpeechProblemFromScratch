@@ -121,23 +121,6 @@ class MambaStack(nn.Module):
         return self.final_norm(x)
 
 
-class SinusoidalPositionEncoding(nn.Module):
-    def __init__(self, d_model: int) -> None:
-        super().__init__()
-        self.d_model = int(d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        positions = torch.arange(x.size(1), device=x.device, dtype=torch.float32).unsqueeze(1)
-        even_dims = torch.arange(0, self.d_model, 2, device=x.device, dtype=torch.float32)
-        angles = positions * torch.exp(-torch.log(x.new_tensor(10000.0).float()) * even_dims / self.d_model)
-
-        encoding = torch.zeros(x.size(1), self.d_model, device=x.device, dtype=torch.float32)
-        encoding[:, 0::2] = torch.sin(angles)
-        if self.d_model > 1:
-            encoding[:, 1::2] = torch.cos(angles[:, : encoding[:, 1::2].size(1)])
-        return x + encoding.to(dtype=x.dtype).unsqueeze(0)
-
-
 class LocationLayer(nn.Module):
     def __init__(
         self,
@@ -301,8 +284,6 @@ class MambaTacotron2(nn.Module):
         dropout = float(dropout if dropout is not None else hp_get("mamba_dropout", 0.1))
 
         self.embedding = nn.Embedding(self.n_symbols, self.d_model, padding_idx=0)
-        self.text_position = SinusoidalPositionEncoding(self.d_model)
-        self.mel_position = SinusoidalPositionEncoding(self.d_model)
         self.encoder = MambaStack(
             d_model=self.d_model,
             n_layers=enc_layers,
@@ -379,7 +360,6 @@ class MambaTacotron2(nn.Module):
 
     def encode(self, text: torch.Tensor, text_lengths: torch.Tensor) -> torch.Tensor:
         x = self.embedding(text)
-        x = self.text_position(x)
         x_fwd = self.encoder(x)
         x_bwd = self.encoder_rev(torch.flip(x, dims=(1,)))
         x_bwd = torch.flip(x_bwd, dims=(1,))
@@ -414,7 +394,6 @@ class MambaTacotron2(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode a mel prefix without running the non-causal postnet."""
         x = self.prenet(mel_input)
-        x = self.mel_position(x)
         x = self.decoder(x)
         x, alignments = self.cross_attn(x, memory, text_lengths)
         x = self.fusion(x)
