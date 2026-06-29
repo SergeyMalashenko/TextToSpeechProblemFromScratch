@@ -46,6 +46,21 @@ class LengthMask:
         return ids.unsqueeze(0) < lengths.unsqueeze(1)
 
 
+def reverse_padded_sequence(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """
+    Reverse only the valid prefix of each sequence.
+
+    Padding remains on the right side, unlike torch.flip(x, dims=(1,)), which
+    moves padded frames to the beginning and can leak padding through a
+    recurrent/SSM encoder.
+    """
+    B, T, _ = x.shape
+    ids = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
+    reverse_ids = (lengths.unsqueeze(1) - 1 - ids).clamp(min=0)
+    gather_ids = torch.where(ids < lengths.unsqueeze(1), reverse_ids, ids)
+    return x.gather(1, gather_ids.unsqueeze(-1).expand_as(x))
+
+
 class Prenet(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.5) -> None:
         super().__init__()
@@ -361,8 +376,8 @@ class MambaTacotron2(nn.Module):
     def encode(self, text: torch.Tensor, text_lengths: torch.Tensor) -> torch.Tensor:
         x = self.embedding(text)
         x_fwd = self.encoder(x)
-        x_bwd = self.encoder_rev(torch.flip(x, dims=(1,)))
-        x_bwd = torch.flip(x_bwd, dims=(1,))
+        x_bwd = self.encoder_rev(reverse_padded_sequence(x, text_lengths))
+        x_bwd = reverse_padded_sequence(x_bwd, text_lengths)
         x = self.encoder_projection(torch.cat([x_fwd, x_bwd], dim=-1))
         mask = LengthMask.make(text_lengths, max_len=x.size(1)).unsqueeze(-1).to(x.dtype)
         return x * mask
