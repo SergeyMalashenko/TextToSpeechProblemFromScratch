@@ -85,7 +85,7 @@ def get_checkpoint_dir() -> Path:
 
 
 def get_log_dir() -> Path:
-    return Path(hp_get("mamba_log_dir", "./logs/mamba_tacotron"))
+    return Path(hp_get("mamba_log_dir", hp_get("log_dir", "./outputs/logs/mamba")))
 
 
 def _safe_experiment_name(name: str) -> str:
@@ -121,7 +121,7 @@ def create_experiment_log_dir(base_dir: str | Path, prefix: str) -> Path:
 
 
 def get_samples_dir() -> Path:
-    return Path(hp_get("sample_path", "./samples/mamba_tacotron"))
+    return Path(hp_get("sample_path", "./outputs/samples/mamba"))
 
 
 def get_max_checkpoints_to_keep() -> int:

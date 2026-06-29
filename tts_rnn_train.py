@@ -88,7 +88,7 @@ def get_log_dir() -> Path:
     Base directory for TensorBoard logs. Every launch creates its own
     timestamped subdirectory inside this folder.
     """
-    return Path(hp_get("rnn_log_dir", "./logs/rnn_tacotron"))
+    return Path(hp_get("rnn_log_dir", hp_get("log_dir", "./outputs/logs/rnn")))
 
 
 def _safe_experiment_name(name: str) -> str:

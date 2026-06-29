@@ -81,7 +81,9 @@ resume_checkpoint = None
 # =============================================================================
 
 checkpoint_path = "./outputs/checkpoints/rnn"
-sample_path = "./outputs/synthesis/rnn"
+rnn_log_dir = "./outputs/logs/rnn"
+sample_path = "./outputs/samples/rnn"
+synthesis_path = "./outputs/synthesis/rnn"
 log_dir = "./outputs/logs/rnn"
 
 # =============================================================================

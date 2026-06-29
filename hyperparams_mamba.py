@@ -116,6 +116,9 @@ image_every_epoch = log_alignment_every_epoch
 # =============================================================================
 
 checkpoint_path = "./outputs/checkpoints/mamba"
-sample_path = "./outputs/synthesis/mamba"
+mel2mag_checkpoint_path = "./outputs/checkpoints/mel2mag"
+mamba_log_dir = "./outputs/logs/mamba"
+sample_path = "./outputs/samples/mamba"
+synthesis_path = "./outputs/synthesis/mamba"
 log_dir = "./outputs/logs/mamba"
 max_checkpoints_to_keep = 5

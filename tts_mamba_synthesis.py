@@ -235,7 +235,7 @@ def resolve_mel2mag_checkpoint(arg_value: str | None) -> Path:
     step = hp_get("restore_step2", None)
     if step is None:
         raise ValueError("MelToMag checkpoint is not provided. Use --mel2mag_ckpt.")
-    checkpoint_dir = Path(hp_get("mel2mag_checkpoint_path", "./checkpoint"))
+    checkpoint_dir = Path(hp_get("mel2mag_checkpoint_path", "./outputs/checkpoints/mel2mag"))
     return checkpoint_dir / f"checkpoint_mel2mag_{step}.pth.tar"
 
 
@@ -453,7 +453,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hifigan_ckpt", type=str, default=None, help="Path to HiFi-GAN checkpoint")
 
     parser.add_argument("--strict", action="store_true", help="Use strict=True when loading checkpoints")
-    parser.add_argument("--out_dir", type=str, default=getattr(hp, "sample_path", "./samples"), help="Output directory")
+    parser.add_argument("--out_dir", type=str, default=getattr(hp, "synthesis_path", getattr(hp, "sample_path", "./outputs/synthesis/mamba")), help="Output directory")
     parser.add_argument("--save_png", action="store_true", help="Save mel spectrogram PNGs")
     parser.add_argument("--save_mag_png", action="store_true", help="Save magnitude spectrogram PNGs")
     parser.add_argument("--save_alignment", action="store_true", help="Save alignment PNG")
