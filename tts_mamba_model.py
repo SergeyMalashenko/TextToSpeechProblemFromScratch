@@ -373,19 +373,10 @@ class MambaTacotron2(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def encode(
-        self,
-        text: torch.Tensor,
-        text_lengths: torch.Tensor,
-        text_reversed: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def encode(self, text: torch.Tensor, text_lengths: torch.Tensor) -> torch.Tensor:
         x = self.embedding(text)
         x_fwd = self.encoder(x)
-        if text_reversed is None:
-            x_rev = reverse_padded_sequence(x, text_lengths)
-        else:
-            x_rev = self.embedding(text_reversed)
-        x_bwd = self.encoder_rev(x_rev)
+        x_bwd = self.encoder_rev(reverse_padded_sequence(x, text_lengths))
         x_bwd = reverse_padded_sequence(x_bwd, text_lengths)
         x = self.encoder_projection(torch.cat([x_fwd, x_bwd], dim=-1))
         mask = LengthMask.make(text_lengths, max_len=x.size(1)).unsqueeze(-1).to(x.dtype)
@@ -492,9 +483,8 @@ class MambaTacotron2(nn.Module):
         mel_input: torch.Tensor,
         output_lengths: Optional[torch.Tensor] = None,
         teacher_forcing_ratio: float = 1.0,
-        text_reversed: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        memory = self.encode(text, text_lengths, text_reversed=text_reversed)
+        memory = self.encode(text, text_lengths)
 
         if self.training and float(teacher_forcing_ratio) < 1.0:
             mel_input = self.build_scheduled_mel_input(
