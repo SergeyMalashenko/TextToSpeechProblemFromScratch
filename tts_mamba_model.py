@@ -18,6 +18,7 @@ It requires mamba-ssm to be installed and fails explicitly otherwise.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Dict, Optional
 
 import torch
@@ -299,7 +300,7 @@ class MambaTacotron2(nn.Module):
         dropout = float(dropout if dropout is not None else hp_get("mamba_dropout", 0.1))
 
         self.embedding = nn.Embedding(self.n_symbols, self.d_model, padding_idx=0)
-        self.encoder = MambaStack(
+        self.encoder_forward = MambaStack(
             d_model=self.d_model,
             n_layers=enc_layers,
             d_state=d_state,
@@ -307,7 +308,7 @@ class MambaTacotron2(nn.Module):
             expand=expand,
             dropout=dropout,
         )
-        self.encoder_rev = MambaStack(
+        self.encoder_backward = MambaStack(
             d_model=self.d_model,
             n_layers=enc_layers,
             d_state=d_state,
@@ -373,12 +374,56 @@ class MambaTacotron2(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
 
+    @staticmethod
+    def _remap_legacy_encoder_keys(state_dict):
+        """
+        Keep old Mamba checkpoints loadable after renaming encoder branches.
+
+        Previous names:
+          encoder.*     -> encoder_forward.*
+          encoder_rev.* -> encoder_backward.*
+        """
+        renamed_prefixes = {
+            "encoder.": "encoder_forward.",
+            "encoder_rev.": "encoder_backward.",
+        }
+
+        remapped = OrderedDict()
+        for key, value in state_dict.items():
+            new_key = key
+            for old_prefix, new_prefix in renamed_prefixes.items():
+                if key.startswith(old_prefix):
+                    new_key = new_prefix + key[len(old_prefix):]
+                    break
+            remapped[new_key] = value
+
+        metadata = getattr(state_dict, "_metadata", None)
+        if metadata is not None:
+            remapped._metadata = OrderedDict()
+            for key, value in metadata.items():
+                new_key = key
+                for old_prefix, new_prefix in renamed_prefixes.items():
+                    metadata_prefix = old_prefix.rstrip(".")
+                    if key == metadata_prefix or key.startswith(old_prefix):
+                        new_key = new_prefix.rstrip(".") + key[len(metadata_prefix):]
+                        break
+                remapped._metadata[new_key] = value
+
+        return remapped
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        state_dict = self._remap_legacy_encoder_keys(state_dict)
+        try:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        except TypeError:
+            return super().load_state_dict(state_dict, strict=strict)
+
     def encode(self, text: torch.Tensor, text_lengths: torch.Tensor) -> torch.Tensor:
         x = self.embedding(text)
-        x_fwd = self.encoder(x)
-        x_bwd = self.encoder_rev(reverse_padded_sequence(x, text_lengths))
-        x_bwd = reverse_padded_sequence(x_bwd, text_lengths)
-        x = self.encoder_projection(torch.cat([x_fwd, x_bwd], dim=-1))
+        x_forward = self.encoder_forward(x)
+        x_backward = self.encoder_backward(reverse_padded_sequence(x, text_lengths))
+        x_backward = reverse_padded_sequence(x_backward, text_lengths)
+        x = self.encoder_projection(torch.cat([x_forward, x_backward], dim=-1))
         mask = LengthMask.make(text_lengths, max_len=x.size(1)).unsqueeze(-1).to(x.dtype)
         return x * mask
 
