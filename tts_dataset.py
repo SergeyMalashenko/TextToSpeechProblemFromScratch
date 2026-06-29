@@ -615,7 +615,14 @@ class VocoderDataset(BaseTTSDataset):
 # Collate functions
 # =============================================================================
 
-def collate_fn_tacotron(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
+def _reverse_1d_valid(seq: np.ndarray) -> np.ndarray:
+    return np.asarray(seq[::-1], dtype=seq.dtype)
+
+
+def _collate_fn_tacotron(
+    batch: List[Mapping[str, Any]],
+    include_reversed_text: bool = False,
+) -> Dict[str, torch.Tensor]:
     if len(batch) == 0:
         raise ValueError("Empty batch")
     if not isinstance(batch[0], Mapping):
@@ -635,6 +642,14 @@ def collate_fn_tacotron(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tenso
         pad_value=0,
         dtype=np.int64,
     )
+
+    text_reversed = None
+    if include_reversed_text:
+        text_reversed = stack_padded_1d(
+            [_reverse_1d_valid(x["text"]) for x in batch],
+            pad_value=0,
+            dtype=np.int64,
+        )
 
     mel_input = stack_padded_2d(
         [x["mel_input"] for x in batch],
@@ -664,7 +679,7 @@ def collate_fn_tacotron(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tenso
             constant_values=1.0,
         )
 
-    return {
+    result = {
         "text": torch.from_numpy(text).long(),
         "text_lengths": torch.from_numpy(text_lengths).long(),
         "mel_input": torch.from_numpy(mel_input).float(),
@@ -672,6 +687,19 @@ def collate_fn_tacotron(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tenso
         "gate_target": torch.from_numpy(gate_target).float(),
         "output_lengths": torch.from_numpy(mel_lengths).long(),
     }
+
+    if text_reversed is not None:
+        result["text_reversed"] = torch.from_numpy(text_reversed).long()
+
+    return result
+
+
+def collate_fn_tacotron(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
+    return _collate_fn_tacotron(batch, include_reversed_text=False)
+
+
+def collate_fn_tacotron_with_reversed_text(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
+    return _collate_fn_tacotron(batch, include_reversed_text=True)
 
 
 def collate_fn_mel2mag(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:

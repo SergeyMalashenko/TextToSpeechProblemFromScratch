@@ -19,6 +19,7 @@ import hyperparams_mamba as hp
 
 from tts_dataset import (
     get_tacotron_dataset, collate_fn_tacotron,
+    collate_fn_tacotron_with_reversed_text,
     compute_dataset_lengths, LengthBucketBatchSampler
 )
 
@@ -175,10 +176,21 @@ def get_lr_decay_gamma() -> float:
     return float(hp_get("lr_decay_gamma", 0.98))
 
 
+def get_precompute_reversed_text() -> bool:
+    return bool(hp_get("precompute_reversed_text", True))
+
+
+def get_tacotron_collate_fn():
+    if get_precompute_reversed_text():
+        return collate_fn_tacotron_with_reversed_text
+    return collate_fn_tacotron
+
+
 def build_train_dataloader(train_dataset) -> DataLoader:
     """Builds the training DataLoader using the same strategy as tts_rnn_train_updated.py."""
     use_bucket_sampler = bool(hp_get("use_bucket_sampler", True))
     pin_memory = bool(hp_get("pin_memory", torch.cuda.is_available()))
+    collate_fn = get_tacotron_collate_fn()
 
     if use_bucket_sampler:
         bucket_size = int(hp_get("bucket_size", int(hp.batch_size) * 20))
@@ -199,7 +211,7 @@ def build_train_dataloader(train_dataset) -> DataLoader:
             batch_sampler=batch_sampler,
             num_workers=get_num_workers(),
             pin_memory=pin_memory,
-            collate_fn=collate_fn_tacotron,
+            collate_fn=collate_fn,
         )
 
     print("[DataLoader] Using plain random sampler")
@@ -207,7 +219,7 @@ def build_train_dataloader(train_dataset) -> DataLoader:
         train_dataset,
         batch_size=int(hp.batch_size),
         shuffle=True,
-        collate_fn=collate_fn_tacotron,
+        collate_fn=collate_fn,
         drop_last=True,
         num_workers=get_num_workers(),
         pin_memory=pin_memory,
@@ -667,6 +679,7 @@ def train_one_step(
             mel_input=batch["mel_input"],
             output_lengths=batch.get("output_lengths", None),
             teacher_forcing_ratio=teacher_forcing_ratio,
+            text_reversed=batch.get("text_reversed", None),
         )
         # RNN-equivalent Tacotron2Loss stores guided_attn_weight inside criterion.
         # Therefore forward signature is criterion(outputs, batch).
@@ -759,6 +772,7 @@ def validate(
                 mel_input=batch["mel_input"],
                 output_lengths=batch.get("output_lengths", None),
                 teacher_forcing_ratio=1.0,
+                text_reversed=batch.get("text_reversed", None),
             )
             # RNN-equivalent Tacotron2Loss stores guided_attn_weight inside criterion.
             losses = criterion(outputs=outputs, batch=batch)
@@ -830,7 +844,7 @@ def main() -> None:
         val_dataset,
         batch_size=int(hp.batch_size),
         shuffle=False,
-        collate_fn=collate_fn_tacotron,
+        collate_fn=get_tacotron_collate_fn(),
         drop_last=False,
         num_workers=max(0, get_num_workers() // 2),
         pin_memory=bool(hp_get("pin_memory", torch.cuda.is_available())),

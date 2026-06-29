@@ -24,6 +24,7 @@ seed = 42
 use_bucket_sampler = False
 bucket_size_multiplier = 20
 bucket_drop_last = False
+precompute_reversed_text = True
 
 # =============================================================================
 # Independent Mamba acoustic model
