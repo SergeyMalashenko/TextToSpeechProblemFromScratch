@@ -882,6 +882,7 @@ def main() -> None:
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size  : {len(val_dataset)}")
     print(f"Log dir           : {log_dir}")
+    print(f"Decoder type      : {hp_get('mamba_decoder_type', 'mamba')}")
     print(f"Optimizer         : AdamW")
     print(f"Base LR           : {float(hp.lr):.2e}")
     print(

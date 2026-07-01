@@ -45,6 +45,17 @@ mamba_attention_location_kernel_size = 31
 mamba_prenet_hidden = 256
 mamba_prenet_dropout = 0.5
 
+# Decoder branch for experiments:
+#   "mamba" -> original full-prefix Mamba decoder
+#   "rnn"   -> Tacotron-style step-wise autoregressive RNN decoder
+mamba_decoder_type = "rnn"
+mamba_rnn_attention_dim = 1024
+mamba_rnn_decoder_dim = 1024
+mamba_rnn_prenet_dims = [256, 256]
+mamba_rnn_prenet_dropout = 0.5
+mamba_rnn_attention_dropout = 0.1
+mamba_rnn_decoder_dropout = 0.1
+
 postnet_channels = 512
 postnet_kernel_size = 5
 postnet_layers = 5
