@@ -988,10 +988,10 @@ class MambaTacotron2(nn.Module):
         aligns = []
 
         for _ in range(self.max_decoder_steps):
-            x = self.prenet(decoder_input)[:, 0, :]
+            x = self.prenet(decoder_input)
             x, decoder_caches = self.mamba_decoder.step(x, decoder_caches)
             x, attention_weights, attention_weights_cum = self.cross_attn.step(
-                query=x,
+                query=x[:, 0, :],
                 memory=memory,
                 processed_memory=processed_memory,
                 invalid_memory=invalid_memory,
@@ -1055,10 +1055,10 @@ class MambaTacotron2(nn.Module):
         gate_outputs = []
         alignments = []
         for t in range(T_mel):
-            x = self.prenet(mel_input[:, t:t + 1, :])[:, 0, :]
+            x = self.prenet(mel_input[:, t:t + 1, :])
             x, decoder_caches = self.mamba_decoder.step(x, decoder_caches)
             x, attention_weights, attention_weights_cum = self.cross_attn.step(
-                query=x,
+                query=x[:, 0, :],
                 memory=memory,
                 processed_memory=processed_memory,
                 invalid_memory=invalid_memory,
