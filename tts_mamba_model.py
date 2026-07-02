@@ -988,10 +988,10 @@ class MambaTacotron2(nn.Module):
         aligns = []
 
         for _ in range(self.max_decoder_steps):
-            x = self.prenet(decoder_input)
+            x = self.prenet(decoder_input)[:, 0, :]
             x, decoder_caches = self.mamba_decoder.step(x, decoder_caches)
             x, attention_weights, attention_weights_cum = self.cross_attn.step(
-                query=x[:, 0, :],
+                query=x,
                 memory=memory,
                 processed_memory=processed_memory,
                 invalid_memory=invalid_memory,
@@ -1023,6 +1023,58 @@ class MambaTacotron2(nn.Module):
             "gate": gate,
             "alignments": alignments,
         }
+
+    @torch.no_grad()
+    def decode_sequence_step_teacher_forced(
+        self,
+        memory: torch.Tensor,
+        text_lengths: torch.Tensor,
+        mel_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Decode a known mel-input sequence through the stateful Mamba step path.
+
+        This is a diagnostic counterpart to decode_sequence(). In eval mode,
+        its outputs should be close to full-sequence decode_sequence() if the
+        Mamba step cache path is equivalent to the normal Mamba forward path.
+        """
+        B, T_mel, _ = mel_input.shape
+        T_text = memory.size(1)
+
+        decoder_caches = self.mamba_decoder.allocate_step_cache(
+            batch_size=B,
+            max_seqlen=T_mel,
+            dtype=memory.dtype,
+        )
+        processed_memory = self.cross_attn.memory_layer(memory)
+        invalid_memory = ~LengthMask.make(text_lengths, max_len=T_text)
+        attention_weights = memory.new_zeros(B, T_text)
+        attention_weights_cum = memory.new_zeros(B, T_text)
+
+        mel_outputs = []
+        gate_outputs = []
+        alignments = []
+        for t in range(T_mel):
+            x = self.prenet(mel_input[:, t:t + 1, :])[:, 0, :]
+            x, decoder_caches = self.mamba_decoder.step(x, decoder_caches)
+            x, attention_weights, attention_weights_cum = self.cross_attn.step(
+                query=x,
+                memory=memory,
+                processed_memory=processed_memory,
+                invalid_memory=invalid_memory,
+                attention_weights=attention_weights,
+                attention_weights_cum=attention_weights_cum,
+            )
+            x = self.fusion(x.unsqueeze(1))
+            mel_outputs.append(self.mel_proj(x))
+            gate_outputs.append(self.gate_proj(x).squeeze(-1))
+            alignments.append(attention_weights.unsqueeze(1))
+
+        return (
+            torch.cat(mel_outputs, dim=1),
+            torch.cat(gate_outputs, dim=1),
+            torch.cat(alignments, dim=1),
+        )
 
     @torch.no_grad()
     def inference(
