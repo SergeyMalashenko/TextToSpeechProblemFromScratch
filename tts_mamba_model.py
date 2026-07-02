@@ -137,6 +137,34 @@ class MambaBlock(nn.Module):
         x = self.dropout(x)
         return residual + x
 
+    def allocate_step_cache(
+        self,
+        batch_size: int,
+        max_seqlen: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not hasattr(self.sequence, "allocate_inference_cache"):
+            raise RuntimeError("mamba_ssm.Mamba does not expose allocate_inference_cache()")
+        return self.sequence.allocate_inference_cache(
+            batch_size=batch_size,
+            max_seqlen=max_seqlen,
+            dtype=dtype,
+        )
+
+    def step(
+        self,
+        x: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if not hasattr(self.sequence, "step"):
+            raise RuntimeError("mamba_ssm.Mamba does not expose step()")
+        residual = x
+        x = self.norm(x)
+        conv_state, ssm_state = cache
+        x, conv_state, ssm_state = self.sequence.step(x, conv_state, ssm_state)
+        x = self.dropout(x)
+        return residual + x, (conv_state, ssm_state)
+
 
 class MambaStack(nn.Module):
     def __init__(
@@ -165,6 +193,32 @@ class MambaStack(nn.Module):
         for block in self.blocks:
             x = block(x)
         return self.final_norm(x)
+
+    def allocate_step_cache(
+        self,
+        batch_size: int,
+        max_seqlen: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        return [
+            block.allocate_step_cache(
+                batch_size=batch_size,
+                max_seqlen=max_seqlen,
+                dtype=dtype,
+            )
+            for block in self.blocks
+        ]
+
+    def step(
+        self,
+        x: torch.Tensor,
+        caches: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        next_caches = []
+        for block, cache in zip(self.blocks, caches):
+            x, cache = block.step(x, cache)
+            next_caches.append(cache)
+        return self.final_norm(x), next_caches
 
 
 class LocationLayer(nn.Module):
@@ -275,6 +329,34 @@ class CrossAttention(nn.Module):
         )
         x = self.norm(x)
         return x, alignment_sequence
+
+    def step(
+        self,
+        query: torch.Tensor,
+        memory: torch.Tensor,
+        processed_memory: torch.Tensor,
+        invalid_memory: torch.Tensor,
+        attention_weights: torch.Tensor,
+        attention_weights_cum: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attention_weights_cat = torch.stack(
+            [attention_weights, attention_weights_cum],
+            dim=1,
+        )
+        energies = self.get_alignment_energies(
+            query=query,
+            processed_memory=processed_memory,
+            attention_weights_cat=attention_weights_cat,
+        )
+        energies = energies.masked_fill(invalid_memory, -float("inf"))
+        attention_weights = F.softmax(energies, dim=1)
+        attention_weights_cum = attention_weights_cum + attention_weights
+        context = torch.bmm(attention_weights.unsqueeze(1), memory).squeeze(1)
+        x = self.context_projection(
+            torch.cat([query, self.dropout(context)], dim=-1)
+        )
+        x = self.norm(x)
+        return x, attention_weights, attention_weights_cum
 
 
 class RNNLocationSensitiveAttention(nn.Module):
@@ -608,8 +690,11 @@ class MambaTacotron2(nn.Module):
         expand = int(expand if expand is not None else hp_get("mamba_expand", 2))
         dropout = float(dropout if dropout is not None else hp_get("mamba_dropout", 0.1))
         self.decoder_type = str(hp_get("mamba_decoder_type", "mamba")).lower()
-        if self.decoder_type not in {"mamba", "rnn"}:
-            raise ValueError(f"mamba_decoder_type must be 'mamba' or 'rnn', got {self.decoder_type!r}")
+        if self.decoder_type not in {"mamba", "mamba_step", "rnn"}:
+            raise ValueError(
+                "mamba_decoder_type must be 'mamba', 'mamba_step', or 'rnn', "
+                f"got {self.decoder_type!r}"
+            )
 
         self.embedding = nn.Embedding(self.n_symbols, self.d_model, padding_idx=0)
         self.encoder_forward = MambaStack(
@@ -867,7 +952,7 @@ class MambaTacotron2(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         memory = self.encode(text, text_lengths)
 
-        if self.decoder_type == "mamba" and self.training and float(teacher_forcing_ratio) < 1.0:
+        if self.decoder_type in {"mamba", "mamba_step"} and self.training and float(teacher_forcing_ratio) < 1.0:
             mel_input = self.build_scheduled_mel_input(
                 memory=memory,
                 text_lengths=text_lengths,
@@ -877,6 +962,67 @@ class MambaTacotron2(nn.Module):
             )
 
         return self.decode_teacher_forced(memory, text_lengths, mel_input)
+
+    @torch.no_grad()
+    def inference_mamba_step(
+        self,
+        memory: torch.Tensor,
+        text_lengths: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        B = memory.size(0)
+        T_text = memory.size(1)
+
+        decoder_caches = self.mamba_decoder.allocate_step_cache(
+            batch_size=B,
+            max_seqlen=self.max_decoder_steps,
+            dtype=memory.dtype,
+        )
+        processed_memory = self.cross_attn.memory_layer(memory)
+        invalid_memory = ~LengthMask.make(text_lengths, max_len=T_text)
+        attention_weights = memory.new_zeros(B, T_text)
+        attention_weights_cum = memory.new_zeros(B, T_text)
+
+        decoder_input = memory.new_zeros(B, 1, self.n_mels)
+        mel_before_frames = []
+        gates = []
+        aligns = []
+
+        for _ in range(self.max_decoder_steps):
+            x = self.prenet(decoder_input)
+            x, decoder_caches = self.mamba_decoder.step(x, decoder_caches)
+            x, attention_weights, attention_weights_cum = self.cross_attn.step(
+                query=x[:, 0, :],
+                memory=memory,
+                processed_memory=processed_memory,
+                invalid_memory=invalid_memory,
+                attention_weights=attention_weights,
+                attention_weights_cum=attention_weights_cum,
+            )
+            x = self.fusion(x.unsqueeze(1))
+
+            next_mel_before = self.mel_proj(x)
+            next_gate = self.gate_proj(x).squeeze(-1)
+            next_align = attention_weights.unsqueeze(1)
+
+            mel_before_frames.append(next_mel_before)
+            gates.append(next_gate)
+            aligns.append(next_align)
+
+            if torch.sigmoid(next_gate).max().item() > self.gate_threshold:
+                break
+
+            decoder_input = next_mel_before
+
+        mel_before = torch.cat(mel_before_frames, dim=1)
+        mel_after = self.postnet(mel_before)
+        gate = torch.cat(gates, dim=1)
+        alignments = torch.cat(aligns, dim=1)
+        return {
+            "mel_before": mel_before,
+            "mel_after": mel_after,
+            "gate": gate,
+            "alignments": alignments,
+        }
 
     @torch.no_grad()
     def inference(
@@ -907,6 +1053,9 @@ class MambaTacotron2(nn.Module):
                 "gate": gate,
                 "alignments": alignments,
             }
+
+        if self.decoder_type == "mamba_step":
+            return self.inference_mamba_step(memory=memory, text_lengths=text_lengths)
 
         mel_before_frames = []
         gates = []

@@ -46,9 +46,10 @@ mamba_prenet_hidden = 256
 mamba_prenet_dropout = 0.5
 
 # Decoder branch for experiments:
-#   "mamba" -> original full-prefix Mamba decoder
-#   "rnn"   -> Tacotron-style step-wise autoregressive RNN decoder
-mamba_decoder_type = "rnn"
+#   "mamba"      -> original full-prefix Mamba decoder
+#   "mamba_step" -> stateful step-by-step Mamba decoder at inference
+#   "rnn"        -> Tacotron-style step-wise autoregressive RNN decoder
+mamba_decoder_type = "mamba_step"
 mamba_rnn_attention_dim = 1024
 mamba_rnn_decoder_dim = 1024
 mamba_rnn_prenet_dims = [256, 256]
@@ -107,7 +108,6 @@ lr_min = 1e-5
 # =============================================================================
 
 resume_mamba_checkpoint = None
-resume_mamba_checkpoint = "outputs/checkpoints/mamba/checkpoint_mamba_tacotron2_epoch_0063.pth.tar"
 
 # =============================================================================
 # Workflow cadence
@@ -126,10 +126,10 @@ image_every_epoch = log_alignment_every_epoch
 # Output paths
 # =============================================================================
 
-checkpoint_path = "./outputs/checkpoints/mamba"
+checkpoint_path = "./outputs/checkpoints/mamba_step"
 mel2mag_checkpoint_path = "./outputs/checkpoints/mel2mag"
-mamba_log_dir = "./outputs/logs/mamba"
-sample_path = "./outputs/samples/mamba"
-synthesis_path = "./outputs/synthesis/mamba"
-log_dir = "./outputs/logs/mamba"
+mamba_log_dir = "./outputs/logs/mamba_step"
+sample_path = "./outputs/samples/mamba_step"
+synthesis_path = "./outputs/synthesis/mamba_step"
+log_dir = "./outputs/logs/mamba_step"
 max_checkpoints_to_keep = 5
