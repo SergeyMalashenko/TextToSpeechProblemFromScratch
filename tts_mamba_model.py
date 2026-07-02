@@ -161,7 +161,15 @@ class MambaBlock(nn.Module):
         residual = x
         x = self.norm(x)
         conv_state, ssm_state = cache
-        x, conv_state, ssm_state = self.sequence.step(x, conv_state, ssm_state)
+        sequence_dtype = next(self.sequence.parameters()).dtype
+        autocast_device = x.device.type if x.device.type in {"cuda", "cpu"} else "cuda"
+        with torch.amp.autocast(autocast_device, enabled=False):
+            x, conv_state, ssm_state = self.sequence.step(
+                x.to(sequence_dtype),
+                conv_state.to(sequence_dtype),
+                ssm_state.to(sequence_dtype),
+            )
+        x = x.to(residual.dtype)
         x = self.dropout(x)
         return residual + x, (conv_state, ssm_state)
 
@@ -1067,7 +1075,6 @@ class MambaTacotron2(nn.Module):
             "alignments": alignments,
         }
 
-    @torch.no_grad()
     def decode_sequence_step_teacher_forced(
         self,
         memory: torch.Tensor,
