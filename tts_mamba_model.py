@@ -723,6 +723,11 @@ class MambaTacotron2(nn.Module):
             out_dim=self.d_model,
             dropout=float(hp_get("mamba_prenet_dropout", 0.5)),
         )
+        self.mamba_step_context_feedback = bool(hp_get("mamba_step_context_feedback", True))
+        self.mamba_step_input_projection = nn.Sequential(
+            nn.Linear(self.d_model * 2, self.d_model),
+            nn.LayerNorm(self.d_model),
+        )
         self.mamba_decoder = MambaStack(
             d_model=self.d_model,
             n_layers=dec_layers,
@@ -782,6 +787,10 @@ class MambaTacotron2(nn.Module):
         nn.init.xavier_uniform_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, -3.0)
         for module in self.encoder_projection:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+        for module in self.mamba_step_input_projection:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
@@ -853,6 +862,12 @@ class MambaTacotron2(nn.Module):
                 memory_lengths=text_lengths,
                 mel_input=mel_input,
             )
+        elif self.decoder_type == "mamba_step":
+            mel_before, gate, alignments = self.decode_sequence_step_teacher_forced(
+                memory=memory,
+                text_lengths=text_lengths,
+                mel_input=mel_input,
+            )
         else:
             mel_before, gate, alignments = self.decode_sequence(
                 memory=memory,
@@ -881,6 +896,29 @@ class MambaTacotron2(nn.Module):
         mel_before = self.mel_proj(x)
         gate = self.gate_proj(x).squeeze(-1)
         return mel_before, gate, alignments
+
+    def build_mamba_step_input(
+        self,
+        mel_frame: torch.Tensor,
+        attention_context: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Build one Mamba decoder input token.
+
+        For mamba_step we feed the previous attention context back into the next
+        decoder state, mirroring the RNN Tacotron decoder loop:
+
+          RNN attention_rnn input: [prenet(prev_mel), prev_context]
+          Mamba step input       : projection([prenet(prev_mel), prev_context])
+
+        This gives the Mamba state an explicit memory of where attention was
+        looking, instead of relying only on previous generated mel frames.
+        """
+        x = self.prenet(mel_frame)
+        if self.mamba_step_context_feedback:
+            context = attention_context.unsqueeze(1).expand(-1, x.size(1), -1)
+            x = self.mamba_step_input_projection(torch.cat([x, context], dim=-1))
+        return x
 
     def build_scheduled_mel_input(
         self,
@@ -981,6 +1019,7 @@ class MambaTacotron2(nn.Module):
         invalid_memory = ~LengthMask.make(text_lengths, max_len=T_text)
         attention_weights = memory.new_zeros(B, T_text)
         attention_weights_cum = memory.new_zeros(B, T_text)
+        attention_context = memory.new_zeros(B, self.d_model)
 
         decoder_input = memory.new_zeros(B, 1, self.n_mels)
         mel_before_frames = []
@@ -988,7 +1027,7 @@ class MambaTacotron2(nn.Module):
         aligns = []
 
         for _ in range(self.max_decoder_steps):
-            x = self.prenet(decoder_input)
+            x = self.build_mamba_step_input(decoder_input, attention_context)
             x, decoder_caches = self.mamba_decoder.step(x, decoder_caches)
             x, attention_weights, attention_weights_cum = self.cross_attn.step(
                 query=x[:, 0, :],
@@ -998,6 +1037,10 @@ class MambaTacotron2(nn.Module):
                 attention_weights=attention_weights,
                 attention_weights_cum=attention_weights_cum,
             )
+            attention_context = torch.bmm(
+                attention_weights.unsqueeze(1),
+                memory,
+            ).squeeze(1)
             x = self.fusion(x.unsqueeze(1))
 
             next_mel_before = self.mel_proj(x)
@@ -1050,12 +1093,13 @@ class MambaTacotron2(nn.Module):
         invalid_memory = ~LengthMask.make(text_lengths, max_len=T_text)
         attention_weights = memory.new_zeros(B, T_text)
         attention_weights_cum = memory.new_zeros(B, T_text)
+        attention_context = memory.new_zeros(B, self.d_model)
 
         mel_outputs = []
         gate_outputs = []
         alignments = []
         for t in range(T_mel):
-            x = self.prenet(mel_input[:, t:t + 1, :])
+            x = self.build_mamba_step_input(mel_input[:, t:t + 1, :], attention_context)
             x, decoder_caches = self.mamba_decoder.step(x, decoder_caches)
             x, attention_weights, attention_weights_cum = self.cross_attn.step(
                 query=x[:, 0, :],
@@ -1065,6 +1109,10 @@ class MambaTacotron2(nn.Module):
                 attention_weights=attention_weights,
                 attention_weights_cum=attention_weights_cum,
             )
+            attention_context = torch.bmm(
+                attention_weights.unsqueeze(1),
+                memory,
+            ).squeeze(1)
             x = self.fusion(x.unsqueeze(1))
             mel_outputs.append(self.mel_proj(x))
             gate_outputs.append(self.gate_proj(x).squeeze(-1))

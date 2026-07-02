@@ -44,6 +44,7 @@ mamba_attention_location_kernel_size = 31
 
 mamba_prenet_hidden = 256
 mamba_prenet_dropout = 0.5
+mamba_step_context_feedback = True
 
 # Decoder branch for experiments:
 #   "mamba"      -> original full-prefix Mamba decoder

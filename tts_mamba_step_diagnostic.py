@@ -49,6 +49,12 @@ def compare_full_and_step(
 ) -> dict[str, float]:
     model.eval()
     memory = model.encode(text, text_lengths)
+    context_feedback = bool(getattr(model, "mamba_step_context_feedback", False))
+    if context_feedback:
+        print(
+            "Note: mamba_step_context_feedback=True, so full-sequence decode "
+            "and step decode use intentionally different decoder inputs."
+        )
 
     full_mel, full_gate, full_align = model.decode_sequence(
         memory=memory,
