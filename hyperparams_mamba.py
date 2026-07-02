@@ -9,7 +9,7 @@ from hyperparams_base import *
 # =============================================================================
 
 epochs = 300
-lr = 1e-3
+lr = 5e-4
 
 batch_size = 48
 num_workers = 32
@@ -69,11 +69,11 @@ gate_threshold = 0.5
 # =============================================================================
 
 gate_pos_weight = 2.0
-guided_attn_sigma = 0.4
+guided_attn_sigma = 0.3
 
 # Keep constant guided-attention pressure, same style as RNN's fixed weight.
-guided_attn_weight_start = 1.5
-guided_attn_weight_end = 1.5
+guided_attn_weight_start = 3.0
+guided_attn_weight_end = 3.0
 guided_attn_decay_start_epoch = 0
 guided_attn_decay_end_epoch = 0
 
@@ -90,7 +90,7 @@ teacher_forcing_decay_end_epoch = 0
 adam_beta1 = 0.9
 adam_beta2 = 0.98
 adam_eps = 1e-9
-weight_decay = 0.0
+weight_decay = 1.0e-4
 clip_grad_norm = 1.0
 
 # =============================================================================
@@ -107,13 +107,14 @@ lr_min = 1e-5
 # =============================================================================
 
 resume_mamba_checkpoint = None
+resume_mamba_checkpoint = "outputs/checkpoints/mamba/checkpoint_mamba_tacotron2_epoch_0063.pth.tar"
 
 # =============================================================================
 # Workflow cadence
 # =============================================================================
 
 validate_every_epoch = 1
-save_every_epoch = 5
+save_every_epoch = 1
 sample_every_epoch = 5
 log_alignment_every_epoch = 1
 
