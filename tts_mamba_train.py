@@ -883,6 +883,7 @@ def main() -> None:
     print(f"Val dataset size  : {len(val_dataset)}")
     print(f"Log dir           : {log_dir}")
     print(f"Decoder type      : {hp_get('mamba_decoder_type', 'mamba')}")
+    print(f"Mamba block type  : {hp_get('mamba_block_type', 'mamba1')}")
     print(f"Optimizer         : AdamW")
     print(f"Base LR           : {float(hp.lr):.2e}")
     print(

@@ -37,6 +37,7 @@ mamba_d_state = 16
 mamba_d_conv = 4
 mamba_expand = 2
 mamba_dropout = 0.2
+mamba_block_type = "mamba3"
 
 mamba_attention_dim = 128
 mamba_attention_location_filters = 32
@@ -127,10 +128,10 @@ image_every_epoch = log_alignment_every_epoch
 # Output paths
 # =============================================================================
 
-checkpoint_path = "./outputs/checkpoints/mamba_step"
+checkpoint_path = "./outputs/checkpoints/mamba3_step"
 mel2mag_checkpoint_path = "./outputs/checkpoints/mel2mag"
-mamba_log_dir = "./outputs/logs/mamba_step"
-sample_path = "./outputs/samples/mamba_step"
-synthesis_path = "./outputs/synthesis/mamba_step"
-log_dir = "./outputs/logs/mamba_step"
+mamba_log_dir = "./outputs/logs/mamba3_step"
+sample_path = "./outputs/samples/mamba3_step"
+synthesis_path = "./outputs/synthesis/mamba3_step"
+log_dir = "./outputs/logs/mamba3_step"
 max_checkpoints_to_keep = 5

@@ -36,7 +36,49 @@ def hp_get(name: str, default):
     return getattr(hp, name, default) if hp is not None else default
 
 
-from mamba_ssm import Mamba
+import mamba_ssm
+
+
+def resolve_mamba_block_class(block_type: str):
+    block_type = str(block_type).lower()
+    class_names = {
+        "mamba": "Mamba",
+        "mamba1": "Mamba",
+        "mamba2": "Mamba2",
+        "mamba3": "Mamba3",
+    }
+    if block_type not in class_names:
+        raise ValueError(
+            "mamba_block_type must be one of: mamba, mamba1, mamba2, mamba3; "
+            f"got {block_type!r}"
+        )
+
+    class_name = class_names[block_type]
+    block_cls = getattr(mamba_ssm, class_name, None)
+    if block_cls is not None:
+        return block_cls
+
+    module_candidates = {
+        "Mamba": ["mamba_ssm.modules.mamba_simple"],
+        "Mamba2": ["mamba_ssm.modules.mamba2", "mamba_ssm.modules.mamba2_simple"],
+        "Mamba3": ["mamba_ssm.modules.mamba3", "mamba_ssm.modules.mamba3_simple"],
+    }
+    import importlib
+
+    for module_name in module_candidates[class_name]:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        block_cls = getattr(module, class_name, None)
+        if block_cls is not None:
+            return block_cls
+
+    raise ImportError(
+        f"Requested mamba_block_type={block_type!r}, but class {class_name} "
+        "was not found in the installed mamba_ssm package. Update mamba-ssm "
+        "to a version that provides this block, or choose another block type."
+    )
 
 
 class LengthMask:
@@ -119,10 +161,13 @@ class MambaBlock(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
         dropout: float = 0.1,
+        block_type: str = "mamba1",
     ) -> None:
         super().__init__()
+        self.block_type = str(block_type).lower()
         self.norm = nn.LayerNorm(d_model)
-        self.sequence = Mamba(
+        block_cls = resolve_mamba_block_class(self.block_type)
+        self.sequence = block_cls(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
@@ -183,6 +228,7 @@ class MambaStack(nn.Module):
         d_conv: int,
         expand: int,
         dropout: float,
+        block_type: str = "mamba1",
     ) -> None:
         super().__init__()
         self.blocks = nn.ModuleList([
@@ -192,6 +238,7 @@ class MambaStack(nn.Module):
                 d_conv=d_conv,
                 expand=expand,
                 dropout=dropout,
+                block_type=block_type,
             )
             for _ in range(n_layers)
         ])
@@ -697,6 +744,7 @@ class MambaTacotron2(nn.Module):
         d_conv = int(d_conv if d_conv is not None else hp_get("mamba_d_conv", 4))
         expand = int(expand if expand is not None else hp_get("mamba_expand", 2))
         dropout = float(dropout if dropout is not None else hp_get("mamba_dropout", 0.1))
+        block_type = str(hp_get("mamba_block_type", "mamba1"))
         self.decoder_type = str(hp_get("mamba_decoder_type", "mamba")).lower()
         if self.decoder_type not in {"mamba", "mamba_step", "rnn"}:
             raise ValueError(
@@ -712,6 +760,7 @@ class MambaTacotron2(nn.Module):
             d_conv=d_conv,
             expand=expand,
             dropout=dropout,
+            block_type=block_type,
         )
         self.encoder_backward = MambaStack(
             d_model=self.d_model,
@@ -720,6 +769,7 @@ class MambaTacotron2(nn.Module):
             d_conv=d_conv,
             expand=expand,
             dropout=dropout,
+            block_type=block_type,
         )
         self.encoder_projection = nn.Sequential(
             nn.Linear(self.d_model * 2, self.d_model),
@@ -743,6 +793,7 @@ class MambaTacotron2(nn.Module):
             d_conv=d_conv,
             expand=expand,
             dropout=dropout,
+            block_type=block_type,
         )
         self.cross_attn = CrossAttention(
             d_model=self.d_model,
