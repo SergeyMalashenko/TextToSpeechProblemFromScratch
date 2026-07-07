@@ -33,7 +33,7 @@ mamba_d_model = 384
 mamba_encoder_layers = 4
 mamba_decoder_layers = 4
 
-mamba_d_state = 16
+mamba_d_state = 32
 mamba_d_conv = 4
 mamba_expand = 2
 mamba_dropout = 0.2

@@ -165,6 +165,11 @@ class MambaBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.block_type = str(block_type).lower()
+        if self.block_type == "mamba3" and int(d_state) not in {32, 64, 128}:
+            raise ValueError(
+                "mamba_block_type='mamba3' requires mamba_d_state to be one of "
+                f"32, 64, 128 for the installed CUDA/CUTLASS step kernel; got {d_state}"
+            )
         self.norm = nn.LayerNorm(d_model)
         block_cls = resolve_mamba_block_class(self.block_type)
         self.sequence = block_cls(
