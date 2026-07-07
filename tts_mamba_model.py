@@ -219,8 +219,18 @@ class MambaBlock(nn.Module):
                 item.to(sequence_dtype) if torch.is_tensor(item) else item
                 for item in cache
             )
+            step_input = x.to(sequence_dtype)
+            squeeze_step_output = False
+            if self.block_type == "mamba3":
+                if step_input.ndim != 3 or step_input.size(1) != 1:
+                    raise RuntimeError(
+                        "mamba3 step adapter expects input shape (B, 1, D), "
+                        f"got {tuple(step_input.shape)}"
+                    )
+                step_input = step_input[:, 0, :]
+                squeeze_step_output = True
             step_output = self.sequence.step(
-                x.to(sequence_dtype),
+                step_input,
                 *cache,
             )
         if isinstance(step_output, tuple):
@@ -229,6 +239,8 @@ class MambaBlock(nn.Module):
         else:
             x = step_output
             next_cache = cache
+        if squeeze_step_output and x.ndim == 2:
+            x = x.unsqueeze(1)
         x = x.to(residual.dtype)
         x = self.dropout(x)
         return residual + x, next_cache
