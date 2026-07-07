@@ -187,36 +187,51 @@ class MambaBlock(nn.Module):
         batch_size: int,
         max_seqlen: int,
         dtype: Optional[torch.dtype] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         if not hasattr(self.sequence, "allocate_inference_cache"):
-            raise RuntimeError("mamba_ssm.Mamba does not expose allocate_inference_cache()")
-        return self.sequence.allocate_inference_cache(
+            raise RuntimeError(
+                f"{self.sequence.__class__.__name__} does not expose allocate_inference_cache()"
+            )
+        cache = self.sequence.allocate_inference_cache(
             batch_size=batch_size,
             max_seqlen=max_seqlen,
             dtype=dtype,
         )
+        if isinstance(cache, tuple):
+            return cache
+        if isinstance(cache, list):
+            return tuple(cache)
+        return (cache,)
 
     def step(
         self,
         x: torch.Tensor,
-        cache: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        cache: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         if not hasattr(self.sequence, "step"):
-            raise RuntimeError("mamba_ssm.Mamba does not expose step()")
+            raise RuntimeError(f"{self.sequence.__class__.__name__} does not expose step()")
         residual = x
         x = self.norm(x)
-        conv_state, ssm_state = cache
         sequence_dtype = next(self.sequence.parameters()).dtype
         autocast_device = x.device.type if x.device.type in {"cuda", "cpu"} else "cuda"
         with torch.amp.autocast(autocast_device, enabled=False):
-            x, conv_state, ssm_state = self.sequence.step(
-                x.to(sequence_dtype),
-                conv_state.to(sequence_dtype),
-                ssm_state.to(sequence_dtype),
+            cache = tuple(
+                item.to(sequence_dtype) if torch.is_tensor(item) else item
+                for item in cache
             )
+            step_output = self.sequence.step(
+                x.to(sequence_dtype),
+                *cache,
+            )
+        if isinstance(step_output, tuple):
+            x = step_output[0]
+            next_cache = tuple(step_output[1:])
+        else:
+            x = step_output
+            next_cache = cache
         x = x.to(residual.dtype)
         x = self.dropout(x)
-        return residual + x, (conv_state, ssm_state)
+        return residual + x, next_cache
 
 
 class MambaStack(nn.Module):
@@ -254,7 +269,7 @@ class MambaStack(nn.Module):
         batch_size: int,
         max_seqlen: int,
         dtype: Optional[torch.dtype] = None,
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    ) -> list[tuple[torch.Tensor, ...]]:
         return [
             block.allocate_step_cache(
                 batch_size=batch_size,
@@ -267,8 +282,8 @@ class MambaStack(nn.Module):
     def step(
         self,
         x: torch.Tensor,
-        caches: list[tuple[torch.Tensor, torch.Tensor]],
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        caches: list[tuple[torch.Tensor, ...]],
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, ...]]]:
         next_caches = []
         for block, cache in zip(self.blocks, caches):
             x, cache = block.step(x, cache)
