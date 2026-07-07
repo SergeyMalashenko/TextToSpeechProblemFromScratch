@@ -203,10 +203,17 @@ class MambaBlock(nn.Module):
             dtype=dtype,
         )
         if isinstance(cache, tuple):
-            return cache
-        if isinstance(cache, list):
-            return tuple(cache)
-        return (cache,)
+            cache_tuple = cache
+        elif isinstance(cache, list):
+            cache_tuple = tuple(cache)
+        else:
+            cache_tuple = (cache,)
+        if self.block_type == "mamba3":
+            cache_tuple = tuple(
+                item.detach().clone().contiguous() if torch.is_tensor(item) else item
+                for item in cache_tuple
+            )
+        return cache_tuple
 
     def step(
         self,
@@ -221,9 +228,22 @@ class MambaBlock(nn.Module):
         autocast_device = x.device.type if x.device.type in {"cuda", "cpu"} else "cuda"
         with torch.amp.autocast(autocast_device, enabled=False):
             cache = tuple(
-                item.to(sequence_dtype) if torch.is_tensor(item) else item
+                item.to(sequence_dtype).contiguous() if torch.is_tensor(item) else item
                 for item in cache
             )
+            if self.block_type == "mamba3":
+                # Mamba3.step mutates its cache buffers in-place.  Some returned
+                # cache tensors are views, so feeding them back into the next
+                # step can break autograd with "view is being modified inplace".
+                #
+                # Keep the original mutable cache buffers for the next step and
+                # detach them from the previous step graph.  This mirrors the
+                # intended stateful-step API: cache is recurrent state storage,
+                # not an activation tensor to backpropagate through directly.
+                cache = tuple(
+                    item.detach() if torch.is_tensor(item) else item
+                    for item in cache
+                )
             step_input = x.to(sequence_dtype)
             squeeze_step_output = False
             if self.block_type == "mamba3":
@@ -240,7 +260,7 @@ class MambaBlock(nn.Module):
             )
         if isinstance(step_output, tuple):
             x = step_output[0]
-            next_cache = tuple(step_output[1:])
+            next_cache = cache if self.block_type == "mamba3" else tuple(step_output[1:])
         else:
             x = step_output
             next_cache = cache
