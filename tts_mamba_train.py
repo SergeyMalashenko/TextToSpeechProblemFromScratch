@@ -698,7 +698,14 @@ def train_one_step(
     stats.update(compute_gate_metrics(outputs["gate"].detach(), batch["gate_target"], batch["output_lengths"]))
     stats.update(compute_attention_metrics(outputs["alignments"].detach(), batch["text_lengths"], batch["output_lengths"]))
     stats.update(compute_mel_metrics(outputs["mel_before"].detach(), outputs["mel_after"].detach(), batch["mel_target"], batch["output_lengths"]))
-    return outputs, stats
+    log_outputs = {
+        # Keep only the small artifact needed by the epoch-level image logger.
+        # Returning the full model outputs would keep the last batch autograd
+        # graph alive until the end of the epoch, which is expensive for the
+        # step-by-step decoder.
+        "alignments": outputs["alignments"].detach().cpu(),
+    }
+    return log_outputs, stats
 
 
 @torch.no_grad()
