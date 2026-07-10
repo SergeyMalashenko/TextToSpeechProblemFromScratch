@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Independent Mamba-based Tacotron-style model.
+Independent Mamba3-based Tacotron-style model.
 
 The model intentionally does not inherit from the existing RNN Tacotron2 class.
 It keeps the same training I/O contract used by tts_rnn_train.py:
@@ -13,12 +13,12 @@ It keeps the same training I/O contract used by tts_rnn_train.py:
         "alignments": (B, T_mel, T_text),
     }
 
-It requires mamba-ssm to be installed and fails explicitly otherwise.
+It requires a mamba-ssm build that provides Mamba3 and fails explicitly
+otherwise.
 """
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -39,45 +39,26 @@ def hp_get(name: str, default):
 import mamba_ssm
 
 
-def resolve_mamba_block_class(block_type: str):
-    block_type = str(block_type).lower()
-    class_names = {
-        "mamba": "Mamba",
-        "mamba1": "Mamba",
-        "mamba2": "Mamba2",
-        "mamba3": "Mamba3",
-    }
-    if block_type not in class_names:
-        raise ValueError(
-            "mamba_block_type must be one of: mamba, mamba1, mamba2, mamba3; "
-            f"got {block_type!r}"
-        )
-
-    class_name = class_names[block_type]
-    block_cls = getattr(mamba_ssm, class_name, None)
+def resolve_mamba3_block_class():
+    block_cls = getattr(mamba_ssm, "Mamba3", None)
     if block_cls is not None:
         return block_cls
 
-    module_candidates = {
-        "Mamba": ["mamba_ssm.modules.mamba_simple"],
-        "Mamba2": ["mamba_ssm.modules.mamba2", "mamba_ssm.modules.mamba2_simple"],
-        "Mamba3": ["mamba_ssm.modules.mamba3", "mamba_ssm.modules.mamba3_simple"],
-    }
     import importlib
 
-    for module_name in module_candidates[class_name]:
+    for module_name in ["mamba_ssm.modules.mamba3", "mamba_ssm.modules.mamba3_simple"]:
         try:
             module = importlib.import_module(module_name)
         except Exception:
             continue
-        block_cls = getattr(module, class_name, None)
+        block_cls = getattr(module, "Mamba3", None)
         if block_cls is not None:
             return block_cls
 
     raise ImportError(
-        f"Requested mamba_block_type={block_type!r}, but class {class_name} "
-        "was not found in the installed mamba_ssm package. Update mamba-ssm "
-        "to a version that provides this block, or choose another block type."
+        "MambaTacotron2 now uses Mamba3 blocks only, but class Mamba3 was not "
+        "found in the installed mamba_ssm package. Update mamba-ssm to a "
+        "version that provides Mamba3."
     )
 
 
@@ -115,9 +96,7 @@ class Prenet(nn.Module):
         self.dropout = float(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Unlike the step-wise RNN decoder, Mamba recomputes the full generated
-        # prefix at inference. Keep eval deterministic so historical decoder
-        # states do not change randomly between generation steps.
+        # Keep the Mamba decoder prenet deterministic in eval/inference.
         for layer in self.layers:
             x = F.relu(layer(x))
             x = F.dropout(x, p=self.dropout, training=self.training)
@@ -130,7 +109,7 @@ class RNNPrenet(nn.Module):
 
     The original RNN baseline keeps prenet dropout enabled during inference, so
     this hybrid branch follows that behavior instead of the deterministic
-    full-prefix Mamba prenet.
+    Mamba3 step-decoder prenet.
     """
     def __init__(self, in_dim: int, sizes: list[int], dropout: float = 0.5) -> None:
         super().__init__()
@@ -161,17 +140,15 @@ class MambaBlock(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
         dropout: float = 0.1,
-        block_type: str = "mamba1",
     ) -> None:
         super().__init__()
-        self.block_type = str(block_type).lower()
-        if self.block_type == "mamba3" and int(d_state) not in {32, 64, 128}:
+        if int(d_state) not in {32, 64, 128}:
             raise ValueError(
-                "mamba_block_type='mamba3' requires mamba_d_state to be one of "
+                "Mamba3 requires mamba_d_state to be one of "
                 f"32, 64, 128 for the installed CUDA/CUTLASS step kernel; got {d_state}"
             )
         self.norm = nn.LayerNorm(d_model)
-        block_cls = resolve_mamba_block_class(self.block_type)
+        block_cls = resolve_mamba3_block_class()
         self.sequence = block_cls(
             d_model=d_model,
             d_state=d_state,
@@ -208,12 +185,10 @@ class MambaBlock(nn.Module):
             cache_tuple = tuple(cache)
         else:
             cache_tuple = (cache,)
-        if self.block_type == "mamba3":
-            cache_tuple = tuple(
-                item.detach().clone().contiguous() if torch.is_tensor(item) else item
-                for item in cache_tuple
-            )
-        return cache_tuple
+        return tuple(
+            item.detach().clone().contiguous() if torch.is_tensor(item) else item
+            for item in cache_tuple
+        )
 
     def step(
         self,
@@ -231,40 +206,36 @@ class MambaBlock(nn.Module):
                 item.to(sequence_dtype).contiguous() if torch.is_tensor(item) else item
                 for item in cache
             )
-            if self.block_type == "mamba3":
-                # Mamba3.step mutates its cache buffers in-place.  Some returned
-                # cache tensors are views, so feeding them back into the next
-                # step can break autograd with "view is being modified inplace".
-                #
-                # Keep the original mutable cache buffers for the next step and
-                # detach them from the previous step graph.  This mirrors the
-                # intended stateful-step API: cache is recurrent state storage,
-                # not an activation tensor to backpropagate through directly.
-                cache = tuple(
-                    item.detach() if torch.is_tensor(item) else item
-                    for item in cache
-                )
+            # Mamba3.step mutates its cache buffers in-place.  Some returned
+            # cache tensors are views, so feeding them back into the next
+            # step can break autograd with "view is being modified inplace".
+            #
+            # Keep the original mutable cache buffers for the next step and
+            # detach them from the previous step graph.  This mirrors the
+            # intended stateful-step API: cache is recurrent state storage,
+            # not an activation tensor to backpropagate through directly.
+            cache = tuple(
+                item.detach() if torch.is_tensor(item) else item
+                for item in cache
+            )
             step_input = x.to(sequence_dtype)
-            squeeze_step_output = False
-            if self.block_type == "mamba3":
-                if step_input.ndim != 3 or step_input.size(1) != 1:
-                    raise RuntimeError(
-                        "mamba3 step adapter expects input shape (B, 1, D), "
-                        f"got {tuple(step_input.shape)}"
-                    )
-                step_input = step_input[:, 0, :]
-                squeeze_step_output = True
+            if step_input.ndim != 3 or step_input.size(1) != 1:
+                raise RuntimeError(
+                    "Mamba3 step adapter expects input shape (B, 1, D), "
+                    f"got {tuple(step_input.shape)}"
+                )
+            step_input = step_input[:, 0, :]
             step_output = self.sequence.step(
                 step_input,
                 *cache,
             )
         if isinstance(step_output, tuple):
             x = step_output[0]
-            next_cache = cache if self.block_type == "mamba3" else tuple(step_output[1:])
+            next_cache = cache
         else:
             x = step_output
             next_cache = cache
-        if squeeze_step_output and x.ndim == 2:
+        if x.ndim == 2:
             x = x.unsqueeze(1)
         x = x.to(residual.dtype)
         x = self.dropout(x)
@@ -280,7 +251,6 @@ class MambaStack(nn.Module):
         d_conv: int,
         expand: int,
         dropout: float,
-        block_type: str = "mamba1",
     ) -> None:
         super().__init__()
         self.blocks = nn.ModuleList([
@@ -290,7 +260,6 @@ class MambaStack(nn.Module):
                 d_conv=d_conv,
                 expand=expand,
                 dropout=dropout,
-                block_type=block_type,
             )
             for _ in range(n_layers)
         ])
@@ -796,11 +765,10 @@ class MambaTacotron2(nn.Module):
         d_conv = int(d_conv if d_conv is not None else hp_get("mamba_d_conv", 4))
         expand = int(expand if expand is not None else hp_get("mamba_expand", 2))
         dropout = float(dropout if dropout is not None else hp_get("mamba_dropout", 0.1))
-        block_type = str(hp_get("mamba_block_type", "mamba1"))
         self.decoder_type = str(hp_get("mamba_decoder_type", "mamba")).lower()
-        if self.decoder_type not in {"mamba", "mamba_step", "rnn"}:
+        if self.decoder_type not in {"mamba", "rnn"}:
             raise ValueError(
-                "mamba_decoder_type must be 'mamba', 'mamba_step', or 'rnn', "
+                "mamba_decoder_type must be 'mamba' or 'rnn', "
                 f"got {self.decoder_type!r}"
             )
 
@@ -812,7 +780,6 @@ class MambaTacotron2(nn.Module):
             d_conv=d_conv,
             expand=expand,
             dropout=dropout,
-            block_type=block_type,
         )
         self.encoder_backward = MambaStack(
             d_model=self.d_model,
@@ -821,7 +788,6 @@ class MambaTacotron2(nn.Module):
             d_conv=d_conv,
             expand=expand,
             dropout=dropout,
-            block_type=block_type,
         )
         self.encoder_projection = nn.Sequential(
             nn.Linear(self.d_model * 2, self.d_model),
@@ -834,7 +800,6 @@ class MambaTacotron2(nn.Module):
             dropout=float(hp_get("mamba_prenet_dropout", 0.5)),
         )
         self.mamba_step_context_feedback = bool(hp_get("mamba_step_context_feedback", True))
-        self.uses_mutable_step_cache = block_type == "mamba3"
         self.mamba_step_input_projection = nn.Sequential(
             nn.Linear(self.d_model * 2, self.d_model),
             nn.LayerNorm(self.d_model),
@@ -846,7 +811,6 @@ class MambaTacotron2(nn.Module):
             d_conv=d_conv,
             expand=expand,
             dropout=dropout,
-            block_type=block_type,
         )
         self.cross_attn = CrossAttention(
             d_model=self.d_model,
@@ -907,52 +871,6 @@ class MambaTacotron2(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    @staticmethod
-    def _remap_legacy_encoder_keys(state_dict):
-        """
-        Keep old Mamba checkpoints loadable after renaming encoder branches.
-
-        Previous names:
-          encoder.*     -> encoder_forward.*
-          encoder_rev.* -> encoder_backward.*
-          decoder.*     -> mamba_decoder.*
-        """
-        renamed_prefixes = {
-            "encoder.": "encoder_forward.",
-            "encoder_rev.": "encoder_backward.",
-            "decoder.": "mamba_decoder.",
-        }
-
-        remapped = OrderedDict()
-        for key, value in state_dict.items():
-            new_key = key
-            for old_prefix, new_prefix in renamed_prefixes.items():
-                if key.startswith(old_prefix):
-                    new_key = new_prefix + key[len(old_prefix):]
-                    break
-            remapped[new_key] = value
-
-        metadata = getattr(state_dict, "_metadata", None)
-        if metadata is not None:
-            remapped._metadata = OrderedDict()
-            for key, value in metadata.items():
-                new_key = key
-                for old_prefix, new_prefix in renamed_prefixes.items():
-                    metadata_prefix = old_prefix.rstrip(".")
-                    if key == metadata_prefix or key.startswith(old_prefix):
-                        new_key = new_prefix.rstrip(".") + key[len(metadata_prefix):]
-                        break
-                remapped._metadata[new_key] = value
-
-        return remapped
-
-    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-        state_dict = self._remap_legacy_encoder_keys(state_dict)
-        try:
-            return super().load_state_dict(state_dict, strict=strict, assign=assign)
-        except TypeError:
-            return super().load_state_dict(state_dict, strict=strict)
-
     def encode(self, text: torch.Tensor, text_lengths: torch.Tensor) -> torch.Tensor:
         x = self.embedding(text)
         x_forward = self.encoder_forward(x)
@@ -974,14 +892,8 @@ class MambaTacotron2(nn.Module):
                 memory_lengths=text_lengths,
                 mel_input=mel_input,
             )
-        elif self.decoder_type == "mamba_step":
-            mel_before, gate, alignments = self.decode_sequence_step_teacher_forced(
-                memory=memory,
-                text_lengths=text_lengths,
-                mel_input=mel_input,
-            )
         else:
-            mel_before, gate, alignments = self.decode_sequence(
+            mel_before, gate, alignments = self.decode_sequence_step_teacher_forced(
                 memory=memory,
                 text_lengths=text_lengths,
                 mel_input=mel_input,
@@ -994,21 +906,6 @@ class MambaTacotron2(nn.Module):
             "alignments": alignments,
         }
 
-    def decode_sequence(
-        self,
-        memory: torch.Tensor,
-        text_lengths: torch.Tensor,
-        mel_input: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Decode a mel prefix without running the non-causal postnet."""
-        x = self.prenet(mel_input)
-        x = self.mamba_decoder(x)
-        x, alignments = self.cross_attn(x, memory, text_lengths)
-        x = self.fusion(x)
-        mel_before = self.mel_proj(x)
-        gate = self.gate_proj(x).squeeze(-1)
-        return mel_before, gate, alignments
-
     def build_mamba_step_input(
         self,
         mel_frame: torch.Tensor,
@@ -1017,7 +914,7 @@ class MambaTacotron2(nn.Module):
         """
         Build one Mamba decoder input token.
 
-        For mamba_step we feed the previous attention context back into the next
+        For the Mamba decoder we feed the previous attention context back into the next
         decoder state, mirroring the RNN Tacotron decoder loop:
 
           RNN attention_rnn input: [prenet(prev_mel), prev_context]
@@ -1032,85 +929,13 @@ class MambaTacotron2(nn.Module):
             x = self.mamba_step_input_projection(torch.cat([x, context], dim=-1))
         return x
 
-    def build_scheduled_mel_input(
-        self,
-        memory: torch.Tensor,
-        text_lengths: torch.Tensor,
-        mel_input: torch.Tensor,
-        teacher_forcing_ratio: float,
-        output_lengths: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Build a mixed decoder input for Mamba scheduled teacher forcing.
-
-        Mamba decoder processes the whole mel sequence in parallel, unlike the
-        RNN Tacotron decoder. Therefore we cannot switch teacher forcing inside
-        a recurrent decoder loop. Instead we use a two-pass approximation:
-
-          1. no-grad teacher-forced pass predicts mel frames;
-          2. predicted frames are shifted by one frame and mixed with the
-             ground-truth mel_input according to teacher_forcing_ratio;
-          3. the real training pass uses this mixed mel_input.
-
-        teacher_forcing_ratio = 1.0 -> pure ground truth mel_input
-        teacher_forcing_ratio = 0.0 -> pure shifted model prediction
-        """
-        ratio = float(teacher_forcing_ratio)
-        ratio = max(0.0, min(1.0, ratio))
-
-        if ratio >= 1.0:
-            return mel_input
-
-        with torch.no_grad():
-            teacher_outputs = self.decode_teacher_forced(
-                memory=memory,
-                text_lengths=text_lengths,
-                mel_input=mel_input,
-            )
-            predicted = teacher_outputs["mel_before"].detach()
-
-        # The decoder input at time t should depend on the previous generated
-        # frame. Frame 0 uses the standard all-zero GO frame.
-        go = torch.zeros_like(mel_input[:, :1, :])
-        predicted_prev = torch.cat([go, predicted[:, :-1, :]], dim=1)
-
-        if ratio <= 0.0:
-            mixed = predicted_prev
-        else:
-            keep_gt = torch.rand(
-                mel_input.size(0),
-                mel_input.size(1),
-                1,
-                device=mel_input.device,
-                dtype=mel_input.dtype,
-            ) < ratio
-            mixed = torch.where(keep_gt, mel_input, predicted_prev)
-
-        if output_lengths is not None:
-            valid = LengthMask.make(output_lengths, max_len=mel_input.size(1)).unsqueeze(-1)
-            mixed = torch.where(valid, mixed, mel_input)
-
-        return mixed
-
     def forward(
         self,
         text: torch.Tensor,
         text_lengths: torch.Tensor,
         mel_input: torch.Tensor,
-        output_lengths: Optional[torch.Tensor] = None,
-        teacher_forcing_ratio: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
         memory = self.encode(text, text_lengths)
-
-        if self.decoder_type in {"mamba", "mamba_step"} and self.training and float(teacher_forcing_ratio) < 1.0:
-            mel_input = self.build_scheduled_mel_input(
-                memory=memory,
-                text_lengths=text_lengths,
-                mel_input=mel_input,
-                teacher_forcing_ratio=teacher_forcing_ratio,
-                output_lengths=output_lengths,
-            )
-
         return self.decode_teacher_forced(memory, text_lengths, mel_input)
 
     @torch.no_grad()
@@ -1188,9 +1013,8 @@ class MambaTacotron2(nn.Module):
         """
         Decode a known mel-input sequence through the stateful Mamba step path.
 
-        This is a diagnostic counterpart to decode_sequence(). In eval mode,
-        its outputs should be close to full-sequence decode_sequence() if the
-        Mamba step cache path is equivalent to the normal Mamba forward path.
+        Training uses the same step-by-step decoder contract as inference, but
+        with ground-truth mel frames as previous-frame inputs.
         """
         B, T_mel, _ = mel_input.shape
         T_text = memory.size(1)
@@ -1228,15 +1052,14 @@ class MambaTacotron2(nn.Module):
             mel_outputs.append(self.mel_proj(x))
             gate_outputs.append(self.gate_proj(x).squeeze(-1))
             alignments.append(attention_weights.unsqueeze(1))
-            if self.uses_mutable_step_cache:
-                # Mamba3.step uses mutable state buffers.  Treat recurrent
-                # attention/context state the same way between decoder steps:
-                # current-step gradients are preserved through the appended
-                # outputs above, but the next step starts from detached state
-                # instead of keeping a full-history autograd chain alive.
-                attention_weights = attention_weights.detach()
-                attention_weights_cum = attention_weights_cum.detach()
-                attention_context = attention_context.detach()
+            # Mamba3.step uses mutable state buffers.  Treat recurrent
+            # attention/context state the same way between decoder steps:
+            # current-step gradients are preserved through the appended
+            # outputs above, but the next step starts from detached state
+            # instead of keeping a full-history autograd chain alive.
+            attention_weights = attention_weights.detach()
+            attention_weights_cum = attention_weights_cum.detach()
+            attention_context = attention_context.detach()
 
         return (
             torch.cat(mel_outputs, dim=1),
@@ -1259,7 +1082,6 @@ class MambaTacotron2(nn.Module):
             )
 
         memory = self.encode(text, text_lengths)
-        B = text.size(0)
 
         if self.decoder_type == "rnn":
             mel_before, gate, alignments = self.rnn_decoder.inference(
@@ -1274,48 +1096,7 @@ class MambaTacotron2(nn.Module):
                 "alignments": alignments,
             }
 
-        if self.decoder_type == "mamba_step":
-            return self.inference_mamba_step(memory=memory, text_lengths=text_lengths)
-
-        mel_before_frames = []
-        gates = []
-        aligns = []
-        # Same decoder contract as RNN Tacotron2:
-        # input[0] is GO, input[t] is the raw mel prediction from step t - 1.
-        decoder_inputs = memory.new_zeros(B, 1, self.n_mels)
-
-        for _ in range(self.max_decoder_steps):
-            mel_sequence, gate_sequence, alignment_sequence = self.decode_sequence(
-                memory=memory,
-                text_lengths=text_lengths,
-                mel_input=decoder_inputs,
-            )
-            next_mel_before = mel_sequence[:, -1:, :]
-            next_gate = gate_sequence[:, -1:]
-            next_align = alignment_sequence[:, -1:, :]
-
-            mel_before_frames.append(next_mel_before)
-            gates.append(next_gate)
-            aligns.append(next_align)
-
-            if torch.sigmoid(next_gate).max().item() > self.gate_threshold:
-                break
-
-            decoder_inputs = torch.cat([decoder_inputs, next_mel_before], dim=1)
-
-        mel_before = torch.cat(mel_before_frames, dim=1)
-        # Tacotron2 postnet sees the complete generated sequence once. Running it
-        # on every prefix would make stored early frames inconsistent because
-        # its convolutions use neighboring frames in both directions.
-        mel_after = self.postnet(mel_before)
-        gate = torch.cat(gates, dim=1)
-        alignments = torch.cat(aligns, dim=1)
-        return {
-            "mel_before": mel_before,
-            "mel_after": mel_after,
-            "gate": gate,
-            "alignments": alignments,
-        }
+        return self.inference_mamba_step(memory=memory, text_lengths=text_lengths)
 
 
 if __name__ == "__main__":
@@ -1323,6 +1104,26 @@ if __name__ == "__main__":
     text = torch.randint(1, 64, (2, 12))
     text_lengths = torch.tensor([12, 9])
     mel_input = torch.randn(2, 50, 80)
-    out = model(text=text, text_lengths=text_lengths, mel_input=mel_input)
-    for k, v in out.items():
-        print(k, tuple(v.shape))
+
+    outputs = model(text=text, text_lengths=text_lengths, mel_input=mel_input)
+    expected_shapes = {
+        "mel_before": (2, 50, 80),
+        "mel_after": (2, 50, 80),
+        "gate": (2, 50),
+        "alignments": (2, 50, 12),
+    }
+    for key, expected_shape in expected_shapes.items():
+        actual_shape = tuple(outputs[key].shape)
+        assert actual_shape == expected_shape, f"{key}: expected {expected_shape}, got {actual_shape}"
+
+    with torch.no_grad():
+        memory = model.encode(text, text_lengths)
+        mel, gate, alignments = model.decode_sequence_step_teacher_forced(
+            memory=memory,
+            text_lengths=text_lengths,
+            mel_input=mel_input,
+        )
+    assert tuple(mel.shape) == expected_shapes["mel_before"]
+    assert tuple(gate.shape) == expected_shapes["gate"]
+    assert tuple(alignments.shape) == expected_shapes["alignments"]
+    print("MambaTacotron2 smoke test passed")

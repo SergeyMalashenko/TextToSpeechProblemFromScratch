@@ -26,7 +26,7 @@ bucket_size_multiplier = 20
 bucket_drop_last = False
 
 # =============================================================================
-# Independent Mamba acoustic model
+# Independent Mamba3 acoustic model
 # =============================================================================
 
 mamba_d_model = 384
@@ -37,7 +37,6 @@ mamba_d_state = 32
 mamba_d_conv = 4
 mamba_expand = 2
 mamba_dropout = 0.2
-mamba_block_type = "mamba3"
 
 mamba_attention_dim = 128
 mamba_attention_location_filters = 32
@@ -48,10 +47,9 @@ mamba_prenet_dropout = 0.5
 mamba_step_context_feedback = True
 
 # Decoder branch for experiments:
-#   "mamba"      -> original full-prefix Mamba decoder
-#   "mamba_step" -> stateful step-by-step Mamba decoder at inference
+#   "mamba" -> stateful step-by-step Mamba3 decoder
 #   "rnn"        -> Tacotron-style step-wise autoregressive RNN decoder
-mamba_decoder_type = "mamba_step"
+mamba_decoder_type = "mamba"
 mamba_rnn_attention_dim = 1024
 mamba_rnn_decoder_dim = 1024
 mamba_rnn_prenet_dims = [256, 256]
@@ -79,12 +77,6 @@ guided_attn_weight_start = 1.0
 guided_attn_weight_end = 1.0
 guided_attn_decay_start_epoch = 0
 guided_attn_decay_end_epoch = 0
-
-# Keep teacher forcing constant (equivalent to RNN baseline behavior).
-teacher_forcing_start = 1.0
-teacher_forcing_end = 1.0
-teacher_forcing_decay_start_epoch = 0
-teacher_forcing_decay_end_epoch = 0
 
 # =============================================================================
 # Optimizer / regularization

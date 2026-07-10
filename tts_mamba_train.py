@@ -295,19 +295,6 @@ class GuidedAttentionScheduler(LinearScheduler):
         return self.get_value(epoch)
 
 
-class TeacherForcingScheduler(LinearScheduler):
-    def __init__(self) -> None:
-        super().__init__(
-            start_value=float(hp_get("teacher_forcing_start", 1.0)),
-            end_value=float(hp_get("teacher_forcing_end", 0.2)),
-            decay_start_epoch=int(hp_get("teacher_forcing_decay_start_epoch", get_lr_warmup_epochs())),
-            decay_end_epoch=int(hp_get("teacher_forcing_decay_end_epoch", int(hp.epochs))),
-        )
-
-    def get_ratio(self, epoch: int) -> float:
-        return self.get_value(epoch)
-
-
 # =============================================================================
 # Metrics
 # =============================================================================
@@ -603,7 +590,6 @@ def train_one_step(
     device: torch.device,
     amp_device_type: str,
     guided_attn_weight: float,
-    teacher_forcing_ratio: float,
 ) -> tuple[Dict[str, torch.Tensor], Dict[str, float]]:
     batch = move_batch_to_device(batch, device)
     set_guided_attn_weight(criterion, guided_attn_weight)
@@ -613,8 +599,6 @@ def train_one_step(
             text=batch["text"],
             text_lengths=batch["text_lengths"],
             mel_input=batch["mel_input"],
-            output_lengths=batch.get("output_lengths", None),
-            teacher_forcing_ratio=teacher_forcing_ratio,
         )
         # RNN-equivalent Tacotron2Loss stores guided_attn_weight inside criterion.
         # Therefore forward signature is criterion(outputs, batch).
@@ -641,7 +625,6 @@ def train_one_step(
         "mel_before_loss": float(loss_dict["mel_before_loss"].item()),
         "mel_after_loss": float(loss_dict["mel_after_loss"].item()),
         "guided_attn_weight": float(guided_attn_weight),
-        "teacher_forcing_ratio": float(teacher_forcing_ratio),
     }
     stats.update(compute_gate_metrics(outputs["gate"].detach(), batch["gate_target"], batch["output_lengths"]))
     stats.update(compute_attention_metrics(outputs["alignments"].detach(), batch["text_lengths"], batch["output_lengths"]))
@@ -717,8 +700,6 @@ def validate(
                 text=batch["text"],
                 text_lengths=batch["text_lengths"],
                 mel_input=batch["mel_input"],
-                output_lengths=batch.get("output_lengths", None),
-                teacher_forcing_ratio=1.0,
             )
             # RNN-equivalent Tacotron2Loss stores guided_attn_weight inside criterion.
             losses = criterion(outputs=outputs, batch=batch)
@@ -737,7 +718,6 @@ def validate(
             "mel_before_loss": float(losses["mel_before_loss"].item()),
             "mel_after_loss": float(losses["mel_after_loss"].item()),
             "guided_attn_weight": float(guided_attn_weight),
-            "teacher_forcing_ratio": 1.0,
         }
         metrics.update(compute_gate_metrics(outputs["gate"], batch["gate_target"], batch["output_lengths"]))
         metrics.update(compute_attention_metrics(outputs["alignments"], batch["text_lengths"], batch["output_lengths"]))
@@ -820,7 +800,6 @@ def main() -> None:
     ).to(device)
 
     guided_attn_scheduler = GuidedAttentionScheduler()
-    teacher_forcing_scheduler = TeacherForcingScheduler()
 
     log_dir = create_experiment_log_dir(get_log_dir(), prefix="mamba")
     writer = SummaryWriter(log_dir=str(log_dir))
@@ -844,7 +823,7 @@ def main() -> None:
     print(f"Val dataset size  : {len(val_dataset)}")
     print(f"Log dir           : {log_dir}")
     print(f"Decoder type      : {hp_get('mamba_decoder_type', 'mamba')}")
-    print(f"Mamba block type  : {hp_get('mamba_block_type', 'mamba1')}")
+    print("Mamba block       : Mamba3")
     print(f"Optimizer         : AdamW")
     print(f"Base LR           : {float(hp.lr):.2e}")
     print(
@@ -857,7 +836,6 @@ def main() -> None:
     print(f"Clip grad norm    : {get_clip_grad_norm():.2f}")
     print(f"Guided attn w     : {guided_attn_scheduler.start_value:.3f} -> {guided_attn_scheduler.end_value:.3f}")
     print(f"Guided attn sigma : {get_guided_attn_sigma():.3f}")
-    print(f"Teacher forcing   : {teacher_forcing_scheduler.start_value:.3f} -> {teacher_forcing_scheduler.end_value:.3f}")
     print(
         "LR schedule       : "
         f"linear warmup {get_lr_warmup_epochs()} epochs, "
@@ -875,7 +853,6 @@ def main() -> None:
         )
         
         current_guided_attn_weight = guided_attn_scheduler.get_weight(epoch)
-        current_teacher_forcing_ratio = teacher_forcing_scheduler.get_ratio(epoch)
 
         pbar = tqdm(train_loader, desc=f"epoch {epoch_index}/{hp.epochs}")
         train_epoch_metrics = []
@@ -893,7 +870,6 @@ def main() -> None:
                 device=device,
                 amp_device_type=amp_device_type,
                 guided_attn_weight=current_guided_attn_weight,
-                teacher_forcing_ratio=current_teacher_forcing_ratio,
             )
             last_outputs = outputs
             train_epoch_metrics.append(stats)
@@ -906,7 +882,6 @@ def main() -> None:
                 sharp=f"{stats['attention_sharpness']:.4f}",
                 melE=f"{stats['mel_after_energy']:.4f}",
                 gaw=f"{stats['guided_attn_weight']:.3f}",
-                tf=f"{stats['teacher_forcing_ratio']:.3f}",
                 lr=f"{current_lr:.2e}",
             )
 
@@ -920,7 +895,6 @@ def main() -> None:
             f"sharp={train_stats['attention_sharpness']:.4f} "
             f"melE={train_stats['mel_after_energy']:.4f} "
             f"gaw={train_stats['guided_attn_weight']:.3f} "
-            f"tf={train_stats['teacher_forcing_ratio']:.3f} "
             f"lr={current_lr:.2e}"
         )
 
@@ -954,7 +928,6 @@ def main() -> None:
                 f"sharp={val_stats['attention_sharpness']:.4f} "
                 f"melE={val_stats['mel_after_energy']:.4f} "
                 f"gaw={val_stats['guided_attn_weight']:.3f} "
-                f"tf={val_stats['teacher_forcing_ratio']:.3f} "
                 f"acc={val_stats['accuracy']:.4f} "
                 f"ar_len={val_stats['ar_length_ratio']:.3f} "
                 f"ar_cov={val_stats['ar_text_coverage']:.3f} "
