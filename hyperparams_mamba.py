@@ -3,25 +3,18 @@ from hyperparams_base import *
 # =============================================================================
 # MambaTacotron2 training configuration
 # =============================================================================
-# This file is intentionally independent from hyperparams_rnn.py.
-# It keeps the same dataset/audio symbols inherited from hyperparams_base.py,
-# but all model-specific parameters below target tts_mamba_model.py.
 
 # =============================================================================
-# Training
+# Training strategy (aligned with RNN baseline)
 # =============================================================================
 
-epochs = 500
-lr = 6e-4
+epochs = 300
+lr = 4e-4
 
-# Mamba/Transformer-style sequence models are usually more stable with a lower
-# LR than the original RNN Tacotron setting. Start here; increase only after the
-# attention and mel-energy curves look stable.
-
-batch_size = 48
+batch_size = 32
 num_workers = 32
 pin_memory = True
-val_ratio = 0.05
+val_ratio = 0.02
 seed = 42
 
 # =============================================================================
@@ -33,70 +26,57 @@ bucket_size_multiplier = 20
 bucket_drop_last = False
 
 # =============================================================================
-# Independent Mamba acoustic model
+# Independent Mamba3 acoustic model
 # =============================================================================
 
-# Main hidden width used by text embeddings, Mamba encoder, Mamba decoder,
-# cross-attention, and mel projection trunk.
 mamba_d_model = 384
-
-# Encoder processes token embeddings.
 mamba_encoder_layers = 4
-
-# Decoder processes teacher-forced mel frames after the prenet.
 mamba_decoder_layers = 4
 
-# mamba-ssm block internals.
-mamba_d_state = 16
+mamba_d_state = 32
 mamba_d_conv = 4
 mamba_expand = 2
 mamba_dropout = 0.2
 
-# Location-sensitive cross-attention copied from the RNN Tacotron2 design.
-# It combines content scores with previous and cumulative alignment maps.
 mamba_attention_dim = 128
 mamba_attention_location_filters = 32
 mamba_attention_location_kernel_size = 31
 
-# Tacotron-style mel prenet before the Mamba decoder.
 mamba_prenet_hidden = 256
 mamba_prenet_dropout = 0.5
+mamba_step_context_feedback = True
 
-# Postnet over predicted mel frames.
+# Decoder branch for experiments:
+#   "mamba" -> stateful step-by-step Mamba3 decoder
+#   "rnn"        -> Tacotron-style step-wise autoregressive RNN decoder
+mamba_decoder_type = "mamba"
+mamba_rnn_attention_dim = 1024
+mamba_rnn_decoder_dim = 1024
+mamba_rnn_prenet_dims = [256, 256]
+mamba_rnn_prenet_dropout = 0.5
+mamba_rnn_attention_dropout = 0.1
+mamba_rnn_decoder_dropout = 0.1
+
 postnet_channels = 512
 postnet_kernel_size = 5
 postnet_layers = 5
 postnet_dropout = 0.5
 
-# Autoregressive inference controls.
 max_decoder_steps = 1000
 gate_threshold = 0.5
 
 # =============================================================================
-# Loss configuration
+# Loss
 # =============================================================================
 
-# The Mamba model still uses Tacotron-style losses:
-#   total = mel_loss + gate_loss + guided_attn_weight * attn_loss
+gate_pos_weight = 1.0
+guided_attn_sigma = 0.4
 
-gate_pos_weight = 2.0
-
-# Scheduled guided attention.
-# Keep diagonal pressure while teacher forcing is being reduced. Only relax it
-# after the model has spent substantial time consuming its own predictions.
+# Keep constant guided-attention pressure, same style as RNN's fixed weight.
 guided_attn_weight_start = 1.0
 guided_attn_weight_end = 1.0
-guided_attn_decay_start_epoch = 200
-guided_attn_decay_end_epoch = 400
-guided_attn_sigma = 0.40
-
-# Scheduled teacher forcing.
-# Start exposing the model to its own predictions after the initial alignment
-# warmup, well before guided attention is relaxed.
-teacher_forcing_start = 1.0
-teacher_forcing_end = 1.0
-teacher_forcing_decay_start_epoch = 300
-teacher_forcing_decay_end_epoch = 500
+guided_attn_decay_start_epoch = 0
+guided_attn_decay_end_epoch = 0
 
 # =============================================================================
 # Optimizer / regularization
@@ -105,38 +85,34 @@ teacher_forcing_decay_end_epoch = 500
 adam_beta1 = 0.9
 adam_beta2 = 0.98
 adam_eps = 1e-9
-weight_decay = 5e-4
+weight_decay = 1.0e-4
 clip_grad_norm = 1.0
 
 # =============================================================================
-# Epoch-based learning-rate schedule
+# Epoch-based LR schedule (approximate RNN warmup+decay behavior)
 # =============================================================================
-# Simple strategy:
-#   1. linear warmup for lr_warmup_epochs;
-#   2. step decay every lr_step_epochs;
-#   3. lr is clipped by lr_min.
 
-lr_warmup_epochs = 50
-lr_step_epochs = 75
-lr_step_gamma = 0.5
+lr_warmup_epochs = 40
+lr_step_epochs = 1
+lr_step_gamma = 0.98
 lr_min = 1e-5
 
 # =============================================================================
 # Resume / restore
 # =============================================================================
 
-resume_mamba_checkpoint = None
+#resume_mamba_checkpoint = "outputs/checkpoints/mamba3_step/checkpoint_mamba_tacotron2_epoch_0071.pth.tar"
+resume_mamba_checkpoint = None 
 
 # =============================================================================
-# Epoch-based workflow cadence
+# Workflow cadence
 # =============================================================================
 
-validate_every_epoch = 5
-save_every_epoch = 25
+validate_every_epoch = 1
+save_every_epoch = 1
 sample_every_epoch = 5
 log_alignment_every_epoch = 1
 
-# Transformer-style aliases supported by the trainer.
 val_every_epoch = validate_every_epoch
 checkpoint_every_epoch = save_every_epoch
 image_every_epoch = log_alignment_every_epoch
@@ -145,7 +121,10 @@ image_every_epoch = log_alignment_every_epoch
 # Output paths
 # =============================================================================
 
-checkpoint_path = "./outputs/checkpoints/mamba"
-sample_path = "./outputs/synthesis/mamba"
-log_dir = "./outputs/logs/mamba"
+checkpoint_path = "./outputs/checkpoints/mamba3_step"
+mel2mag_checkpoint_path = "./outputs/checkpoints/mel2mag"
+mamba_log_dir = "./outputs/logs/mamba3_step"
+sample_path = "./outputs/samples/mamba3_step"
+synthesis_path = "./outputs/synthesis/mamba3_step"
+log_dir = "./outputs/logs/mamba3_step"
 max_checkpoints_to_keep = 5

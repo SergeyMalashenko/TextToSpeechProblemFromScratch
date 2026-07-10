@@ -60,6 +60,7 @@ data_path = "./data/LJSpeech-1.1"
 outputs_root = "./outputs"
 checkpoint_root = "./outputs/checkpoints"
 logs_root = "./outputs/logs"
+samples_root = "./outputs/samples"
 synthesis_root = "./outputs/synthesis"
 
 # Acoustic model checkpoints
@@ -70,8 +71,12 @@ rnn_log_dir = "./outputs/logs/rnn"
 transformer_log_dir = "./outputs/logs/transformer"
 mel2mag_log_dir = "./outputs/logs/mel2mag"
 
-# Synthesis samples
-sample_path = "./outputs/synthesis/rnn"
+# Training samples and standalone synthesis outputs
+sample_path = "./outputs/samples/rnn"
+synthesis_path = "./outputs/synthesis/rnn"
+
+# Auxiliary acoustic checkpoints
+mel2mag_checkpoint_path = "./outputs/checkpoints/mel2mag"
 
 # Vocoder checkpoints
 simple_vocoder_checkpoint_path = "./outputs/checkpoints/vocoder_simple"

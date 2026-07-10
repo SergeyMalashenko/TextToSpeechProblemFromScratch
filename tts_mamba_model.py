@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Independent Mamba-based Tacotron-style model.
+Independent Mamba3-based Tacotron-style model.
 
 The model intentionally does not inherit from the existing RNN Tacotron2 class.
 It keeps the same training I/O contract used by tts_rnn_train.py:
@@ -13,12 +13,14 @@ It keeps the same training I/O contract used by tts_rnn_train.py:
         "alignments": (B, T_mel, T_text),
     }
 
-It requires mamba-ssm to be installed and fails explicitly otherwise.
+It requires a mamba-ssm build that provides Mamba3 and fails explicitly
+otherwise.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -34,7 +36,30 @@ def hp_get(name: str, default):
     return getattr(hp, name, default) if hp is not None else default
 
 
-from mamba_ssm import Mamba
+import mamba_ssm
+
+
+def resolve_mamba3_block_class():
+    block_cls = getattr(mamba_ssm, "Mamba3", None)
+    if block_cls is not None:
+        return block_cls
+
+    import importlib
+
+    for module_name in ["mamba_ssm.modules.mamba3", "mamba_ssm.modules.mamba3_simple"]:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        block_cls = getattr(module, "Mamba3", None)
+        if block_cls is not None:
+            return block_cls
+
+    raise ImportError(
+        "MambaTacotron2 now uses Mamba3 blocks only, but class Mamba3 was not "
+        "found in the installed mamba_ssm package. Update mamba-ssm to a "
+        "version that provides Mamba3."
+    )
 
 
 class LengthMask:
@@ -44,6 +69,21 @@ class LengthMask:
             max_len = int(lengths.max().item())
         ids = torch.arange(max_len, device=lengths.device)
         return ids.unsqueeze(0) < lengths.unsqueeze(1)
+
+
+def reverse_padded_sequence(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """
+    Reverse only the valid prefix of each sequence.
+
+    Padding remains on the right side, unlike torch.flip(x, dims=(1,)), which
+    moves padded frames to the beginning and can leak padding through a
+    recurrent/SSM encoder.
+    """
+    B, T, _ = x.shape
+    ids = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
+    reverse_ids = (lengths.unsqueeze(1) - 1 - ids).clamp(min=0)
+    gather_ids = torch.where(ids < lengths.unsqueeze(1), reverse_ids, ids)
+    return x.gather(1, gather_ids.unsqueeze(-1).expand_as(x))
 
 
 class Prenet(nn.Module):
@@ -56,12 +96,39 @@ class Prenet(nn.Module):
         self.dropout = float(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Unlike the step-wise RNN decoder, Mamba recomputes the full generated
-        # prefix at inference. Keep eval deterministic so historical decoder
-        # states do not change randomly between generation steps.
+        # Keep the Mamba decoder prenet deterministic in eval/inference.
         for layer in self.layers:
             x = F.relu(layer(x))
             x = F.dropout(x, p=self.dropout, training=self.training)
+        return x
+
+
+class RNNPrenet(nn.Module):
+    """
+    Tacotron-style prenet used by the step-wise RNN decoder.
+
+    The original RNN baseline keeps prenet dropout enabled during inference, so
+    this hybrid branch follows that behavior instead of the deterministic
+    Mamba3 step-decoder prenet.
+    """
+    def __init__(self, in_dim: int, sizes: list[int], dropout: float = 0.5) -> None:
+        super().__init__()
+        layers = []
+        current_dim = in_dim
+        for out_dim in sizes:
+            out_dim = int(out_dim)
+            layers.append(nn.Linear(current_dim, out_dim))
+            current_dim = out_dim
+        self.layers = nn.ModuleList(layers)
+        self.dropout = float(dropout)
+
+    @property
+    def out_dim(self) -> int:
+        return self.layers[-1].out_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for linear in self.layers:
+            x = F.dropout(F.relu(linear(x)), p=self.dropout, training=True)
         return x
 
 
@@ -75,8 +142,14 @@ class MambaBlock(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
+        if int(d_state) not in {32, 64, 128}:
+            raise ValueError(
+                "Mamba3 requires mamba_d_state to be one of "
+                f"32, 64, 128 for the installed CUDA/CUTLASS step kernel; got {d_state}"
+            )
         self.norm = nn.LayerNorm(d_model)
-        self.sequence = Mamba(
+        block_cls = resolve_mamba3_block_class()
+        self.sequence = block_cls(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
@@ -90,6 +163,83 @@ class MambaBlock(nn.Module):
         x = self.sequence(x)
         x = self.dropout(x)
         return residual + x
+
+    def allocate_step_cache(
+        self,
+        batch_size: int,
+        max_seqlen: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> tuple[torch.Tensor, ...]:
+        if not hasattr(self.sequence, "allocate_inference_cache"):
+            raise RuntimeError(
+                f"{self.sequence.__class__.__name__} does not expose allocate_inference_cache()"
+            )
+        cache = self.sequence.allocate_inference_cache(
+            batch_size=batch_size,
+            max_seqlen=max_seqlen,
+            dtype=dtype,
+        )
+        if isinstance(cache, tuple):
+            cache_tuple = cache
+        elif isinstance(cache, list):
+            cache_tuple = tuple(cache)
+        else:
+            cache_tuple = (cache,)
+        return tuple(
+            item.detach().clone().contiguous() if torch.is_tensor(item) else item
+            for item in cache_tuple
+        )
+
+    def step(
+        self,
+        x: torch.Tensor,
+        cache: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        if not hasattr(self.sequence, "step"):
+            raise RuntimeError(f"{self.sequence.__class__.__name__} does not expose step()")
+        residual = x
+        x = self.norm(x)
+        sequence_dtype = next(self.sequence.parameters()).dtype
+        autocast_device = x.device.type if x.device.type in {"cuda", "cpu"} else "cuda"
+        with torch.amp.autocast(autocast_device, enabled=False):
+            cache = tuple(
+                item.to(sequence_dtype).contiguous() if torch.is_tensor(item) else item
+                for item in cache
+            )
+            # Mamba3.step mutates its cache buffers in-place.  Some returned
+            # cache tensors are views, so feeding them back into the next
+            # step can break autograd with "view is being modified inplace".
+            #
+            # Keep the original mutable cache buffers for the next step and
+            # detach them from the previous step graph.  This mirrors the
+            # intended stateful-step API: cache is recurrent state storage,
+            # not an activation tensor to backpropagate through directly.
+            cache = tuple(
+                item.detach() if torch.is_tensor(item) else item
+                for item in cache
+            )
+            step_input = x.to(sequence_dtype)
+            if step_input.ndim != 3 or step_input.size(1) != 1:
+                raise RuntimeError(
+                    "Mamba3 step adapter expects input shape (B, 1, D), "
+                    f"got {tuple(step_input.shape)}"
+                )
+            step_input = step_input[:, 0, :]
+            step_output = self.sequence.step(
+                step_input,
+                *cache,
+            )
+        if isinstance(step_output, tuple):
+            x = step_output[0]
+            next_cache = cache
+        else:
+            x = step_output
+            next_cache = cache
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+        x = x.to(residual.dtype)
+        x = self.dropout(x)
+        return residual + x, next_cache
 
 
 class MambaStack(nn.Module):
@@ -120,22 +270,31 @@ class MambaStack(nn.Module):
             x = block(x)
         return self.final_norm(x)
 
+    def allocate_step_cache(
+        self,
+        batch_size: int,
+        max_seqlen: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> list[tuple[torch.Tensor, ...]]:
+        return [
+            block.allocate_step_cache(
+                batch_size=batch_size,
+                max_seqlen=max_seqlen,
+                dtype=dtype,
+            )
+            for block in self.blocks
+        ]
 
-class SinusoidalPositionEncoding(nn.Module):
-    def __init__(self, d_model: int) -> None:
-        super().__init__()
-        self.d_model = int(d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        positions = torch.arange(x.size(1), device=x.device, dtype=torch.float32).unsqueeze(1)
-        even_dims = torch.arange(0, self.d_model, 2, device=x.device, dtype=torch.float32)
-        angles = positions * torch.exp(-torch.log(x.new_tensor(10000.0).float()) * even_dims / self.d_model)
-
-        encoding = torch.zeros(x.size(1), self.d_model, device=x.device, dtype=torch.float32)
-        encoding[:, 0::2] = torch.sin(angles)
-        if self.d_model > 1:
-            encoding[:, 1::2] = torch.cos(angles[:, : encoding[:, 1::2].size(1)])
-        return x + encoding.to(dtype=x.dtype).unsqueeze(0)
+    def step(
+        self,
+        x: torch.Tensor,
+        caches: list[tuple[torch.Tensor, ...]],
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, ...]]]:
+        next_caches = []
+        for block, cache in zip(self.blocks, caches):
+            x, cache = block.step(x, cache)
+            next_caches.append(cache)
+        return self.final_norm(x), next_caches
 
 
 class LocationLayer(nn.Module):
@@ -247,6 +406,313 @@ class CrossAttention(nn.Module):
         x = self.norm(x)
         return x, alignment_sequence
 
+    def step(
+        self,
+        query: torch.Tensor,
+        memory: torch.Tensor,
+        processed_memory: torch.Tensor,
+        invalid_memory: torch.Tensor,
+        attention_weights: torch.Tensor,
+        attention_weights_cum: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attention_weights_cat = torch.stack(
+            [attention_weights, attention_weights_cum],
+            dim=1,
+        )
+        energies = self.get_alignment_energies(
+            query=query,
+            processed_memory=processed_memory,
+            attention_weights_cat=attention_weights_cat,
+        )
+        energies = energies.masked_fill(invalid_memory, -float("inf"))
+        attention_weights = F.softmax(energies, dim=1)
+        attention_weights_cum = attention_weights_cum + attention_weights
+        context = torch.bmm(attention_weights.unsqueeze(1), memory).squeeze(1)
+        x = self.context_projection(
+            torch.cat([query, self.dropout(context)], dim=-1)
+        )
+        x = self.norm(x)
+        return x, attention_weights, attention_weights_cum
+
+
+class RNNLocationSensitiveAttention(nn.Module):
+    """Location-sensitive attention used by the RNN decoder branch."""
+    def __init__(
+        self,
+        query_dim: int,
+        memory_dim: int,
+        attention_dim: int,
+        location_filters: int,
+        location_kernel_size: int,
+    ) -> None:
+        super().__init__()
+        self.query_layer = nn.Linear(query_dim, attention_dim, bias=False)
+        self.memory_layer = nn.Linear(memory_dim, attention_dim, bias=False)
+        self.v = nn.Linear(attention_dim, 1, bias=False)
+        self.location_layer = LocationLayer(
+            attention_dim=attention_dim,
+            n_filters=location_filters,
+            kernel_size=location_kernel_size,
+        )
+        self.score_mask_value = -float("inf")
+
+    def get_alignment_energies(
+        self,
+        query: torch.Tensor,
+        processed_memory: torch.Tensor,
+        attention_weights_cat: torch.Tensor,
+    ) -> torch.Tensor:
+        processed_query = self.query_layer(query).unsqueeze(1)
+        processed_attention = self.location_layer(attention_weights_cat)
+        return self.v(
+            torch.tanh(processed_query + processed_attention + processed_memory)
+        ).squeeze(-1)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        memory: torch.Tensor,
+        processed_memory: torch.Tensor,
+        attention_weights_cat: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        energies = self.get_alignment_energies(
+            query=query,
+            processed_memory=processed_memory,
+            attention_weights_cat=attention_weights_cat,
+        )
+        if mask is not None:
+            energies = energies.masked_fill(mask, self.score_mask_value)
+
+        attention_weights = F.softmax(energies, dim=1)
+        attention_context = torch.bmm(attention_weights.unsqueeze(1), memory).squeeze(1)
+        return attention_context, attention_weights
+
+
+@dataclass
+class RNNDecoderStates:
+    attention_hidden: torch.Tensor
+    attention_cell: torch.Tensor
+    decoder_hidden: torch.Tensor
+    decoder_cell: torch.Tensor
+    attention_weights: torch.Tensor
+    attention_weights_cum: torch.Tensor
+    attention_context: torch.Tensor
+
+
+class RNNDecoder(nn.Module):
+    """
+    Tacotron-style autoregressive decoder for the hybrid Mamba experiment.
+
+    The encoder memory still comes from the bidirectional Mamba encoder, but
+    mel generation is step-wise and stateful like the working RNN baseline.
+    """
+    def __init__(
+        self,
+        n_mels: int,
+        encoder_dim: int,
+        attention_rnn_dim: int,
+        decoder_rnn_dim: int,
+        attention_dim: int,
+        location_filters: int,
+        location_kernel_size: int,
+        prenet_dims: list[int],
+        prenet_dropout: float,
+        attention_dropout: float,
+        decoder_dropout: float,
+        max_decoder_steps: int,
+        gate_threshold: float,
+    ) -> None:
+        super().__init__()
+        self.n_mels = int(n_mels)
+        self.encoder_dim = int(encoder_dim)
+        self.attention_rnn_dim = int(attention_rnn_dim)
+        self.decoder_rnn_dim = int(decoder_rnn_dim)
+        self.attention_dropout = float(attention_dropout)
+        self.decoder_dropout = float(decoder_dropout)
+        self.max_decoder_steps = int(max_decoder_steps)
+        self.gate_threshold = float(gate_threshold)
+
+        self.prenet = RNNPrenet(
+            in_dim=self.n_mels,
+            sizes=prenet_dims,
+            dropout=prenet_dropout,
+        )
+        self.attention_rnn = nn.LSTMCell(
+            self.prenet.out_dim + self.encoder_dim,
+            self.attention_rnn_dim,
+        )
+        self.attention_layer = RNNLocationSensitiveAttention(
+            query_dim=self.attention_rnn_dim,
+            memory_dim=self.encoder_dim,
+            attention_dim=attention_dim,
+            location_filters=location_filters,
+            location_kernel_size=location_kernel_size,
+        )
+        self.decoder_rnn = nn.LSTMCell(
+            self.attention_rnn_dim + self.encoder_dim,
+            self.decoder_rnn_dim,
+        )
+        self.linear_projection = nn.Linear(
+            self.decoder_rnn_dim + self.encoder_dim,
+            self.n_mels,
+        )
+        self.gate_layer = nn.Linear(
+            self.decoder_rnn_dim + self.encoder_dim,
+            1,
+        )
+
+    def get_go_frame(self, memory: torch.Tensor) -> torch.Tensor:
+        return memory.new_zeros(memory.size(0), self.n_mels)
+
+    def initialize_decoder_states(
+        self,
+        memory: torch.Tensor,
+        memory_lengths: torch.Tensor,
+    ) -> Tuple[RNNDecoderStates, torch.Tensor, torch.Tensor]:
+        B, T_enc, _ = memory.size()
+        device = memory.device
+        dtype = memory.dtype
+        states = RNNDecoderStates(
+            attention_hidden=torch.zeros(B, self.attention_rnn_dim, device=device, dtype=dtype),
+            attention_cell=torch.zeros(B, self.attention_rnn_dim, device=device, dtype=dtype),
+            decoder_hidden=torch.zeros(B, self.decoder_rnn_dim, device=device, dtype=dtype),
+            decoder_cell=torch.zeros(B, self.decoder_rnn_dim, device=device, dtype=dtype),
+            attention_weights=torch.zeros(B, T_enc, device=device, dtype=dtype),
+            attention_weights_cum=torch.zeros(B, T_enc, device=device, dtype=dtype),
+            attention_context=torch.zeros(B, self.encoder_dim, device=device, dtype=dtype),
+        )
+        processed_memory = self.attention_layer.memory_layer(memory)
+        mask = ~LengthMask.make(memory_lengths, max_len=T_enc)
+        return states, processed_memory, mask
+
+    def decode(
+        self,
+        decoder_input: torch.Tensor,
+        states: RNNDecoderStates,
+        memory: torch.Tensor,
+        processed_memory: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, RNNDecoderStates]:
+        cell_input = torch.cat([decoder_input, states.attention_context], dim=-1)
+        attention_hidden, attention_cell = self.attention_rnn(
+            cell_input,
+            (states.attention_hidden, states.attention_cell),
+        )
+        attention_hidden = F.dropout(
+            attention_hidden,
+            p=self.attention_dropout,
+            training=self.training,
+        )
+
+        attention_weights_cat = torch.stack(
+            [states.attention_weights, states.attention_weights_cum],
+            dim=1,
+        )
+        attention_context, attention_weights = self.attention_layer(
+            query=attention_hidden,
+            memory=memory,
+            processed_memory=processed_memory,
+            attention_weights_cat=attention_weights_cat,
+            mask=mask,
+        )
+        attention_weights_cum = states.attention_weights_cum + attention_weights
+
+        decoder_input = torch.cat([attention_hidden, attention_context], dim=-1)
+        decoder_hidden, decoder_cell = self.decoder_rnn(
+            decoder_input,
+            (states.decoder_hidden, states.decoder_cell),
+        )
+        decoder_hidden = F.dropout(
+            decoder_hidden,
+            p=self.decoder_dropout,
+            training=self.training,
+        )
+
+        projection_input = torch.cat([decoder_hidden, attention_context], dim=-1)
+        mel_output = self.linear_projection(projection_input)
+        gate_output = self.gate_layer(projection_input)
+
+        new_states = RNNDecoderStates(
+            attention_hidden=attention_hidden,
+            attention_cell=attention_cell,
+            decoder_hidden=decoder_hidden,
+            decoder_cell=decoder_cell,
+            attention_weights=attention_weights,
+            attention_weights_cum=attention_weights_cum,
+            attention_context=attention_context,
+        )
+        return mel_output, gate_output, attention_weights, new_states
+
+    def parse_decoder_outputs(
+        self,
+        mel_outputs: list[torch.Tensor],
+        gate_outputs: list[torch.Tensor],
+        alignments: list[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mel_outputs = torch.stack(mel_outputs, dim=1)
+        gate_outputs = torch.stack(gate_outputs, dim=1).squeeze(-1)
+        alignments = torch.stack(alignments, dim=1)
+        return mel_outputs, gate_outputs, alignments
+
+    def forward(
+        self,
+        memory: torch.Tensor,
+        memory_lengths: torch.Tensor,
+        mel_input: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        states, processed_memory, mask = self.initialize_decoder_states(memory, memory_lengths)
+        decoder_inputs = self.prenet(mel_input).transpose(0, 1)
+
+        mel_outputs = []
+        gate_outputs = []
+        alignments = []
+        for decoder_input in decoder_inputs:
+            mel_output, gate_output, alignment, states = self.decode(
+                decoder_input=decoder_input,
+                states=states,
+                memory=memory,
+                processed_memory=processed_memory,
+                mask=mask,
+            )
+            mel_outputs.append(mel_output)
+            gate_outputs.append(gate_output)
+            alignments.append(alignment)
+
+        return self.parse_decoder_outputs(mel_outputs, gate_outputs, alignments)
+
+    @torch.no_grad()
+    def inference(
+        self,
+        memory: torch.Tensor,
+        memory_lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        states, processed_memory, mask = self.initialize_decoder_states(memory, memory_lengths)
+        decoder_input = self.get_go_frame(memory)
+
+        mel_outputs = []
+        gate_outputs = []
+        alignments = []
+        for _ in range(self.max_decoder_steps):
+            prenet_input = self.prenet(decoder_input)
+            mel_output, gate_output, alignment, states = self.decode(
+                decoder_input=prenet_input,
+                states=states,
+                memory=memory,
+                processed_memory=processed_memory,
+                mask=mask,
+            )
+            mel_outputs.append(mel_output)
+            gate_outputs.append(gate_output)
+            alignments.append(alignment)
+
+            if torch.sigmoid(gate_output).max().item() > self.gate_threshold:
+                break
+
+            decoder_input = mel_output
+
+        return self.parse_decoder_outputs(mel_outputs, gate_outputs, alignments)
+
 
 class Postnet(nn.Module):
     def __init__(self, n_mels: int, channels: int = 512, kernel_size: int = 5, n_layers: int = 5, dropout: float = 0.5) -> None:
@@ -299,11 +765,15 @@ class MambaTacotron2(nn.Module):
         d_conv = int(d_conv if d_conv is not None else hp_get("mamba_d_conv", 4))
         expand = int(expand if expand is not None else hp_get("mamba_expand", 2))
         dropout = float(dropout if dropout is not None else hp_get("mamba_dropout", 0.1))
+        self.decoder_type = str(hp_get("mamba_decoder_type", "mamba")).lower()
+        if self.decoder_type not in {"mamba", "rnn"}:
+            raise ValueError(
+                "mamba_decoder_type must be 'mamba' or 'rnn', "
+                f"got {self.decoder_type!r}"
+            )
 
         self.embedding = nn.Embedding(self.n_symbols, self.d_model, padding_idx=0)
-        self.text_position = SinusoidalPositionEncoding(self.d_model)
-        self.mel_position = SinusoidalPositionEncoding(self.d_model)
-        self.encoder = MambaStack(
+        self.encoder_forward = MambaStack(
             d_model=self.d_model,
             n_layers=enc_layers,
             d_state=d_state,
@@ -311,7 +781,7 @@ class MambaTacotron2(nn.Module):
             expand=expand,
             dropout=dropout,
         )
-        self.encoder_rev = MambaStack(
+        self.encoder_backward = MambaStack(
             d_model=self.d_model,
             n_layers=enc_layers,
             d_state=d_state,
@@ -329,7 +799,12 @@ class MambaTacotron2(nn.Module):
             out_dim=self.d_model,
             dropout=float(hp_get("mamba_prenet_dropout", 0.5)),
         )
-        self.decoder = MambaStack(
+        self.mamba_step_context_feedback = bool(hp_get("mamba_step_context_feedback", True))
+        self.mamba_step_input_projection = nn.Sequential(
+            nn.Linear(self.d_model * 2, self.d_model),
+            nn.LayerNorm(self.d_model),
+        )
+        self.mamba_decoder = MambaStack(
             d_model=self.d_model,
             n_layers=dec_layers,
             d_state=d_state,
@@ -343,6 +818,21 @@ class MambaTacotron2(nn.Module):
             location_filters=int(hp_get("mamba_attention_location_filters", 32)),
             location_kernel_size=int(hp_get("mamba_attention_location_kernel_size", 31)),
             dropout=dropout,
+        )
+        self.rnn_decoder = RNNDecoder(
+            n_mels=self.n_mels,
+            encoder_dim=self.d_model,
+            attention_rnn_dim=int(hp_get("mamba_rnn_attention_dim", hp_get("attention_rnn_dim", 1024))),
+            decoder_rnn_dim=int(hp_get("mamba_rnn_decoder_dim", hp_get("decoder_rnn_dim", 1024))),
+            attention_dim=int(hp_get("mamba_attention_dim", 128)),
+            location_filters=int(hp_get("mamba_attention_location_filters", 32)),
+            location_kernel_size=int(hp_get("mamba_attention_location_kernel_size", 31)),
+            prenet_dims=list(hp_get("mamba_rnn_prenet_dims", [256, 256])),
+            prenet_dropout=float(hp_get("mamba_rnn_prenet_dropout", hp_get("mamba_prenet_dropout", 0.5))),
+            attention_dropout=float(hp_get("mamba_rnn_attention_dropout", 0.1)),
+            decoder_dropout=float(hp_get("mamba_rnn_decoder_dropout", 0.1)),
+            max_decoder_steps=self.max_decoder_steps,
+            gate_threshold=self.gate_threshold,
         )
         self.fusion = nn.Sequential(
             nn.Linear(self.d_model, self.d_model * 2),
@@ -376,14 +866,17 @@ class MambaTacotron2(nn.Module):
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
+        for module in self.mamba_step_input_projection:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
 
     def encode(self, text: torch.Tensor, text_lengths: torch.Tensor) -> torch.Tensor:
         x = self.embedding(text)
-        x = self.text_position(x)
-        x_fwd = self.encoder(x)
-        x_bwd = self.encoder_rev(torch.flip(x, dims=(1,)))
-        x_bwd = torch.flip(x_bwd, dims=(1,))
-        x = self.encoder_projection(torch.cat([x_fwd, x_bwd], dim=-1))
+        x_forward = self.encoder_forward(x)
+        x_backward = self.encoder_backward(reverse_padded_sequence(x, text_lengths))
+        x_backward = reverse_padded_sequence(x_backward, text_lengths)
+        x = self.encoder_projection(torch.cat([x_forward, x_backward], dim=-1))
         mask = LengthMask.make(text_lengths, max_len=x.size(1)).unsqueeze(-1).to(x.dtype)
         return x * mask
 
@@ -393,11 +886,18 @@ class MambaTacotron2(nn.Module):
         text_lengths: torch.Tensor,
         mel_input: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        mel_before, gate, alignments = self.decode_sequence(
-            memory=memory,
-            text_lengths=text_lengths,
-            mel_input=mel_input,
-        )
+        if self.decoder_type == "rnn":
+            mel_before, gate, alignments = self.rnn_decoder(
+                memory=memory,
+                memory_lengths=text_lengths,
+                mel_input=mel_input,
+            )
+        else:
+            mel_before, gate, alignments = self.decode_sequence_step_teacher_forced(
+                memory=memory,
+                text_lengths=text_lengths,
+                mel_input=mel_input,
+            )
         mel_after = self.postnet(mel_before)
         return {
             "mel_before": mel_before,
@@ -406,102 +906,166 @@ class MambaTacotron2(nn.Module):
             "alignments": alignments,
         }
 
-    def decode_sequence(
+    def build_mamba_step_input(
         self,
-        memory: torch.Tensor,
-        text_lengths: torch.Tensor,
-        mel_input: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Decode a mel prefix without running the non-causal postnet."""
-        x = self.prenet(mel_input)
-        x = self.mel_position(x)
-        x = self.decoder(x)
-        x, alignments = self.cross_attn(x, memory, text_lengths)
-        x = self.fusion(x)
-        mel_before = self.mel_proj(x)
-        gate = self.gate_proj(x).squeeze(-1)
-        return mel_before, gate, alignments
-
-    def build_scheduled_mel_input(
-        self,
-        memory: torch.Tensor,
-        text_lengths: torch.Tensor,
-        mel_input: torch.Tensor,
-        teacher_forcing_ratio: float,
-        output_lengths: Optional[torch.Tensor] = None,
+        mel_frame: torch.Tensor,
+        attention_context: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Build a mixed decoder input for Mamba scheduled teacher forcing.
+        Build one Mamba decoder input token.
 
-        Mamba decoder processes the whole mel sequence in parallel, unlike the
-        RNN Tacotron decoder. Therefore we cannot switch teacher forcing inside
-        a recurrent decoder loop. Instead we use a two-pass approximation:
+        For the Mamba decoder we feed the previous attention context back into the next
+        decoder state, mirroring the RNN Tacotron decoder loop:
 
-          1. no-grad teacher-forced pass predicts mel frames;
-          2. predicted frames are shifted by one frame and mixed with the
-             ground-truth mel_input according to teacher_forcing_ratio;
-          3. the real training pass uses this mixed mel_input.
+          RNN attention_rnn input: [prenet(prev_mel), prev_context]
+          Mamba step input       : projection([prenet(prev_mel), prev_context])
 
-        teacher_forcing_ratio = 1.0 -> pure ground truth mel_input
-        teacher_forcing_ratio = 0.0 -> pure shifted model prediction
+        This gives the Mamba state an explicit memory of where attention was
+        looking, instead of relying only on previous generated mel frames.
         """
-        ratio = float(teacher_forcing_ratio)
-        ratio = max(0.0, min(1.0, ratio))
-
-        if ratio >= 1.0:
-            return mel_input
-
-        with torch.no_grad():
-            teacher_outputs = self.decode_teacher_forced(
-                memory=memory,
-                text_lengths=text_lengths,
-                mel_input=mel_input,
-            )
-            predicted = teacher_outputs["mel_before"].detach()
-
-        # The decoder input at time t should depend on the previous generated
-        # frame. Frame 0 uses the standard all-zero GO frame.
-        go = torch.zeros_like(mel_input[:, :1, :])
-        predicted_prev = torch.cat([go, predicted[:, :-1, :]], dim=1)
-
-        if ratio <= 0.0:
-            mixed = predicted_prev
-        else:
-            keep_gt = torch.rand(
-                mel_input.size(0),
-                mel_input.size(1),
-                1,
-                device=mel_input.device,
-                dtype=mel_input.dtype,
-            ) < ratio
-            mixed = torch.where(keep_gt, mel_input, predicted_prev)
-
-        if output_lengths is not None:
-            valid = LengthMask.make(output_lengths, max_len=mel_input.size(1)).unsqueeze(-1)
-            mixed = torch.where(valid, mixed, mel_input)
-
-        return mixed
+        x = self.prenet(mel_frame)
+        if self.mamba_step_context_feedback:
+            context = attention_context.unsqueeze(1).expand(-1, x.size(1), -1)
+            x = self.mamba_step_input_projection(torch.cat([x, context], dim=-1))
+        return x
 
     def forward(
         self,
         text: torch.Tensor,
         text_lengths: torch.Tensor,
         mel_input: torch.Tensor,
-        output_lengths: Optional[torch.Tensor] = None,
-        teacher_forcing_ratio: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
         memory = self.encode(text, text_lengths)
-
-        if self.training and float(teacher_forcing_ratio) < 1.0:
-            mel_input = self.build_scheduled_mel_input(
-                memory=memory,
-                text_lengths=text_lengths,
-                mel_input=mel_input,
-                teacher_forcing_ratio=teacher_forcing_ratio,
-                output_lengths=output_lengths,
-            )
-
         return self.decode_teacher_forced(memory, text_lengths, mel_input)
+
+    @torch.no_grad()
+    def inference_mamba_step(
+        self,
+        memory: torch.Tensor,
+        text_lengths: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        B = memory.size(0)
+        T_text = memory.size(1)
+
+        decoder_caches = self.mamba_decoder.allocate_step_cache(
+            batch_size=B,
+            max_seqlen=self.max_decoder_steps,
+            dtype=memory.dtype,
+        )
+        processed_memory = self.cross_attn.memory_layer(memory)
+        invalid_memory = ~LengthMask.make(text_lengths, max_len=T_text)
+        attention_weights = memory.new_zeros(B, T_text)
+        attention_weights_cum = memory.new_zeros(B, T_text)
+        attention_context = memory.new_zeros(B, self.d_model)
+
+        decoder_input = memory.new_zeros(B, 1, self.n_mels)
+        mel_before_frames = []
+        gates = []
+        aligns = []
+
+        for _ in range(self.max_decoder_steps):
+            x = self.build_mamba_step_input(decoder_input, attention_context)
+            x, decoder_caches = self.mamba_decoder.step(x, decoder_caches)
+            x, attention_weights, attention_weights_cum = self.cross_attn.step(
+                query=x[:, 0, :],
+                memory=memory,
+                processed_memory=processed_memory,
+                invalid_memory=invalid_memory,
+                attention_weights=attention_weights,
+                attention_weights_cum=attention_weights_cum,
+            )
+            attention_context = torch.bmm(
+                attention_weights.unsqueeze(1),
+                memory,
+            ).squeeze(1)
+            x = self.fusion(x.unsqueeze(1))
+
+            next_mel_before = self.mel_proj(x)
+            next_gate = self.gate_proj(x).squeeze(-1)
+            next_align = attention_weights.unsqueeze(1)
+
+            mel_before_frames.append(next_mel_before)
+            gates.append(next_gate)
+            aligns.append(next_align)
+
+            if torch.sigmoid(next_gate).max().item() > self.gate_threshold:
+                break
+
+            decoder_input = next_mel_before
+
+        mel_before = torch.cat(mel_before_frames, dim=1)
+        mel_after = self.postnet(mel_before)
+        gate = torch.cat(gates, dim=1)
+        alignments = torch.cat(aligns, dim=1)
+        return {
+            "mel_before": mel_before,
+            "mel_after": mel_after,
+            "gate": gate,
+            "alignments": alignments,
+        }
+
+    def decode_sequence_step_teacher_forced(
+        self,
+        memory: torch.Tensor,
+        text_lengths: torch.Tensor,
+        mel_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Decode a known mel-input sequence through the stateful Mamba step path.
+
+        Training uses the same step-by-step decoder contract as inference, but
+        with ground-truth mel frames as previous-frame inputs.
+        """
+        B, T_mel, _ = mel_input.shape
+        T_text = memory.size(1)
+
+        decoder_caches = self.mamba_decoder.allocate_step_cache(
+            batch_size=B,
+            max_seqlen=T_mel,
+            dtype=memory.dtype,
+        )
+        processed_memory = self.cross_attn.memory_layer(memory)
+        invalid_memory = ~LengthMask.make(text_lengths, max_len=T_text)
+        attention_weights = memory.new_zeros(B, T_text)
+        attention_weights_cum = memory.new_zeros(B, T_text)
+        attention_context = memory.new_zeros(B, self.d_model)
+
+        mel_outputs = []
+        gate_outputs = []
+        alignments = []
+        for t in range(T_mel):
+            x = self.build_mamba_step_input(mel_input[:, t:t + 1, :], attention_context)
+            x, decoder_caches = self.mamba_decoder.step(x, decoder_caches)
+            x, attention_weights, attention_weights_cum = self.cross_attn.step(
+                query=x[:, 0, :],
+                memory=memory,
+                processed_memory=processed_memory,
+                invalid_memory=invalid_memory,
+                attention_weights=attention_weights,
+                attention_weights_cum=attention_weights_cum,
+            )
+            attention_context = torch.bmm(
+                attention_weights.unsqueeze(1),
+                memory,
+            ).squeeze(1)
+            x = self.fusion(x.unsqueeze(1))
+            mel_outputs.append(self.mel_proj(x))
+            gate_outputs.append(self.gate_proj(x).squeeze(-1))
+            alignments.append(attention_weights.unsqueeze(1))
+            # Mamba3.step uses mutable state buffers.  Treat recurrent
+            # attention/context state the same way between decoder steps:
+            # current-step gradients are preserved through the appended
+            # outputs above, but the next step starts from detached state
+            # instead of keeping a full-history autograd chain alive.
+            attention_weights = attention_weights.detach()
+            attention_weights_cum = attention_weights_cum.detach()
+            attention_context = attention_context.detach()
+
+        return (
+            torch.cat(mel_outputs, dim=1),
+            torch.cat(gate_outputs, dim=1),
+            torch.cat(alignments, dim=1),
+        )
 
     @torch.no_grad()
     def inference(
@@ -518,47 +1082,21 @@ class MambaTacotron2(nn.Module):
             )
 
         memory = self.encode(text, text_lengths)
-        B = text.size(0)
 
-        mel_before_frames = []
-        gates = []
-        aligns = []
-        # Same decoder contract as RNN Tacotron2:
-        # input[0] is GO, input[t] is the raw mel prediction from step t - 1.
-        decoder_inputs = memory.new_zeros(B, 1, self.n_mels)
-
-        for _ in range(self.max_decoder_steps):
-            mel_sequence, gate_sequence, alignment_sequence = self.decode_sequence(
+        if self.decoder_type == "rnn":
+            mel_before, gate, alignments = self.rnn_decoder.inference(
                 memory=memory,
-                text_lengths=text_lengths,
-                mel_input=decoder_inputs,
+                memory_lengths=text_lengths,
             )
-            next_mel_before = mel_sequence[:, -1:, :]
-            next_gate = gate_sequence[:, -1:]
-            next_align = alignment_sequence[:, -1:, :]
+            mel_after = self.postnet(mel_before)
+            return {
+                "mel_before": mel_before,
+                "mel_after": mel_after,
+                "gate": gate,
+                "alignments": alignments,
+            }
 
-            mel_before_frames.append(next_mel_before)
-            gates.append(next_gate)
-            aligns.append(next_align)
-
-            if torch.sigmoid(next_gate).max().item() > self.gate_threshold:
-                break
-
-            decoder_inputs = torch.cat([decoder_inputs, next_mel_before], dim=1)
-
-        mel_before = torch.cat(mel_before_frames, dim=1)
-        # Tacotron2 postnet sees the complete generated sequence once. Running it
-        # on every prefix would make stored early frames inconsistent because
-        # its convolutions use neighboring frames in both directions.
-        mel_after = self.postnet(mel_before)
-        gate = torch.cat(gates, dim=1)
-        alignments = torch.cat(aligns, dim=1)
-        return {
-            "mel_before": mel_before,
-            "mel_after": mel_after,
-            "gate": gate,
-            "alignments": alignments,
-        }
+        return self.inference_mamba_step(memory=memory, text_lengths=text_lengths)
 
 
 if __name__ == "__main__":
@@ -566,6 +1104,26 @@ if __name__ == "__main__":
     text = torch.randint(1, 64, (2, 12))
     text_lengths = torch.tensor([12, 9])
     mel_input = torch.randn(2, 50, 80)
-    out = model(text=text, text_lengths=text_lengths, mel_input=mel_input)
-    for k, v in out.items():
-        print(k, tuple(v.shape))
+
+    outputs = model(text=text, text_lengths=text_lengths, mel_input=mel_input)
+    expected_shapes = {
+        "mel_before": (2, 50, 80),
+        "mel_after": (2, 50, 80),
+        "gate": (2, 50),
+        "alignments": (2, 50, 12),
+    }
+    for key, expected_shape in expected_shapes.items():
+        actual_shape = tuple(outputs[key].shape)
+        assert actual_shape == expected_shape, f"{key}: expected {expected_shape}, got {actual_shape}"
+
+    with torch.no_grad():
+        memory = model.encode(text, text_lengths)
+        mel, gate, alignments = model.decode_sequence_step_teacher_forced(
+            memory=memory,
+            text_lengths=text_lengths,
+            mel_input=mel_input,
+        )
+    assert tuple(mel.shape) == expected_shapes["mel_before"]
+    assert tuple(gate.shape) == expected_shapes["gate"]
+    assert tuple(alignments.shape) == expected_shapes["alignments"]
+    print("MambaTacotron2 smoke test passed")

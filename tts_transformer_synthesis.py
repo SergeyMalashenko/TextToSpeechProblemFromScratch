@@ -129,7 +129,7 @@ def resolve_mel2mag_checkpoint(arg_value: str | None) -> Path:
     if arg_value: return Path(arg_value)
     step = hp_get("restore_step2", None)
     if step is None: raise ValueError("Mel2Mag checkpoint is not provided. Use --mel2mag_ckpt.")
-    return Path(hp.checkpoint_path) / f"checkpoint_mel2mag_{step}.pth.tar"
+    return Path(hp_get("mel2mag_checkpoint_path", "./outputs/checkpoints/mel2mag")) / f"checkpoint_mel2mag_{step}.pth.tar"
 
 def resolve_simple_vocoder_checkpoint(arg_value: str | None) -> Path:
     if arg_value: return Path(arg_value)
@@ -303,7 +303,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mel2mag_ckpt", type=str, default=None)
     parser.add_argument("--vocoder_ckpt", type=str, default=None)
     parser.add_argument("--hifigan_ckpt", type=str, default=None)
-    parser.add_argument("--out_dir", type=str, default="./samples_transformer_tts")
+    parser.add_argument("--out_dir", type=str, default=getattr(hp, "synthesis_path", getattr(hp, "sample_path", "./outputs/synthesis/transformer")))
     parser.add_argument("--spell_plate", action="store_true")
     parser.add_argument("--save_png", action="store_true")
     parser.add_argument("--save_alignment", action="store_true")

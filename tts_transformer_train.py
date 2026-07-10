@@ -87,11 +87,11 @@ def get_checkpoint_dir() -> Path:
 
 
 def get_log_dir() -> Path:
-    return Path(hp_get("transformer_log_dir", "./logs/transformer_tacotron"))
+    return Path(hp_get("transformer_log_dir", hp_get("log_dir", "./outputs/logs/transformer")))
 
 
 def get_samples_dir() -> Path:
-    return Path(hp_get("sample_path", "./samples")) / "transformer_tacotron"
+    return Path(hp_get("sample_path", "./outputs/samples/transformer"))
 
 
 def _safe_experiment_name(name: str) -> str:

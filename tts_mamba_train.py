@@ -67,24 +67,12 @@ def get_gate_pos_weight() -> float:
     return float(hp_get("gate_pos_weight", 5.0))
 
 
-def get_val_every_epoch() -> int:
-    return int(hp_get("val_every_epoch", hp_get("validate_every_epoch", 1)))
-
-
-def get_image_every_epoch() -> int:
-    return int(hp_get("image_every_epoch", hp_get("log_alignment_every_epoch", 1)))
-
-
-def get_checkpoint_every_epoch() -> int:
-    return int(hp_get("checkpoint_every_epoch", hp_get("save_every_epoch", 1)))
-
-
 def get_checkpoint_dir() -> Path:
     return Path(hp_get("checkpoint_path", "./checkpoint"))
 
 
 def get_log_dir() -> Path:
-    return Path(hp_get("mamba_log_dir", "./logs/mamba_tacotron"))
+    return Path(hp_get("mamba_log_dir", hp_get("log_dir", "./outputs/logs/mamba")))
 
 
 def _safe_experiment_name(name: str) -> str:
@@ -120,7 +108,7 @@ def create_experiment_log_dir(base_dir: str | Path, prefix: str) -> Path:
 
 
 def get_samples_dir() -> Path:
-    return Path(hp_get("sample_path", "./samples/mamba_tacotron"))
+    return Path(hp_get("sample_path", "./outputs/samples/mamba"))
 
 
 def get_max_checkpoints_to_keep() -> int:
@@ -147,10 +135,6 @@ def get_log_alignment_every_epoch() -> int:
     return int(hp_get("log_alignment_every_epoch", 1))
 
 
-def get_lr_schedule_type() -> str:
-    return str(hp_get("lr_schedule_type", "warmup_invsqrt_by_epoch"))
-
-
 def get_lr_warmup_epochs() -> int:
     return int(hp_get("lr_warmup_epochs", 20))
 
@@ -163,16 +147,8 @@ def get_lr_step_gamma() -> float:
     return float(hp_get("lr_step_gamma", 0.5))
 
 
-def get_lr_hold_epochs() -> int:
-    return int(hp_get("lr_hold_epochs", 0))
-
-
 def get_lr_min() -> float:
     return float(hp_get("lr_min", 1e-5))
-
-
-def get_lr_decay_gamma() -> float:
-    return float(hp_get("lr_decay_gamma", 0.98))
 
 
 def build_train_dataloader(train_dataset) -> DataLoader:
@@ -226,34 +202,6 @@ def set_seed(seed: int) -> None:
 def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-
-def adjust_learning_rate(
-    optimizer: torch.optim.Optimizer,
-    step_num: int,
-    warmup_step: int = 4000,
-) -> float:
-    """Noam-style step schedule used by the updated RNN trainer."""
-    lr = float(hp.lr) * (warmup_step ** 0.5) * min(
-        step_num * (warmup_step ** -1.5),
-        step_num ** -0.5,
-    )
-    for group in optimizer.param_groups:
-        group["lr"] = lr
-    return float(lr)
-
-
-def get_lr_by_step(
-    optimizer: torch.optim.Optimizer,
-    step_num: int,
-    warmup_step: int = 4000,
-) -> float:
-    lr = hp.lr * (warmup_step ** 0.5) * min(
-        step_num * (warmup_step ** -1.5),
-        step_num ** -0.5,
-    )
-    for group in optimizer.param_groups:
-        group["lr"] = lr
-    return float(lr)
 
 def get_lr_by_epoch(
     optimizer: torch.optim.Optimizer,
@@ -344,19 +292,6 @@ class GuidedAttentionScheduler(LinearScheduler):
         )
 
     def get_weight(self, epoch: int) -> float:
-        return self.get_value(epoch)
-
-
-class TeacherForcingScheduler(LinearScheduler):
-    def __init__(self) -> None:
-        super().__init__(
-            start_value=float(hp_get("teacher_forcing_start", 1.0)),
-            end_value=float(hp_get("teacher_forcing_end", 0.2)),
-            decay_start_epoch=int(hp_get("teacher_forcing_decay_start_epoch", get_lr_warmup_epochs())),
-            decay_end_epoch=int(hp_get("teacher_forcing_decay_end_epoch", int(hp.epochs))),
-        )
-
-    def get_ratio(self, epoch: int) -> float:
         return self.get_value(epoch)
 
 
@@ -655,7 +590,6 @@ def train_one_step(
     device: torch.device,
     amp_device_type: str,
     guided_attn_weight: float,
-    teacher_forcing_ratio: float,
 ) -> tuple[Dict[str, torch.Tensor], Dict[str, float]]:
     batch = move_batch_to_device(batch, device)
     set_guided_attn_weight(criterion, guided_attn_weight)
@@ -665,8 +599,6 @@ def train_one_step(
             text=batch["text"],
             text_lengths=batch["text_lengths"],
             mel_input=batch["mel_input"],
-            output_lengths=batch.get("output_lengths", None),
-            teacher_forcing_ratio=teacher_forcing_ratio,
         )
         # RNN-equivalent Tacotron2Loss stores guided_attn_weight inside criterion.
         # Therefore forward signature is criterion(outputs, batch).
@@ -693,22 +625,29 @@ def train_one_step(
         "mel_before_loss": float(loss_dict["mel_before_loss"].item()),
         "mel_after_loss": float(loss_dict["mel_after_loss"].item()),
         "guided_attn_weight": float(guided_attn_weight),
-        "teacher_forcing_ratio": float(teacher_forcing_ratio),
     }
     stats.update(compute_gate_metrics(outputs["gate"].detach(), batch["gate_target"], batch["output_lengths"]))
     stats.update(compute_attention_metrics(outputs["alignments"].detach(), batch["text_lengths"], batch["output_lengths"]))
     stats.update(compute_mel_metrics(outputs["mel_before"].detach(), outputs["mel_after"].detach(), batch["mel_target"], batch["output_lengths"]))
-    return outputs, stats
+    log_outputs = {
+        # Keep only the small artifact needed by the epoch-level image logger.
+        # Returning the full model outputs would keep the last batch autograd
+        # graph alive until the end of the epoch, which is expensive for the
+        # step-by-step decoder.
+        "alignments": outputs["alignments"].detach().cpu(),
+    }
+    return log_outputs, stats
 
 
 @torch.no_grad()
 def compute_autoregressive_metrics(
     model: nn.Module,
     batch: Dict[str, torch.Tensor],
+    device: torch.device,
 ) -> Dict[str, float]:
     model_w = unwrap_model(model)
-    text = batch["text"][:1]
-    text_lengths = batch["text_lengths"][:1]
+    text = batch["text"][:1].to(device)
+    text_lengths = batch["text_lengths"][:1].to(device)
     target_frames = int(batch["output_lengths"][0].item())
 
     outputs = model_w.inference(text=text, text_lengths=text_lengths)
@@ -751,14 +690,16 @@ def validate(
     for batch in tqdm(dataloader, desc="validation", leave=False):
         batch = move_batch_to_device(batch, device)
         if autoregressive_batch is None:
-            autoregressive_batch = batch
+            autoregressive_batch = {
+                "text": batch["text"][:1].detach().cpu(),
+                "text_lengths": batch["text_lengths"][:1].detach().cpu(),
+                "output_lengths": batch["output_lengths"][:1].detach().cpu(),
+            }
         with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
             outputs = model(
                 text=batch["text"],
                 text_lengths=batch["text_lengths"],
                 mel_input=batch["mel_input"],
-                output_lengths=batch.get("output_lengths", None),
-                teacher_forcing_ratio=1.0,
             )
             # RNN-equivalent Tacotron2Loss stores guided_attn_weight inside criterion.
             losses = criterion(outputs=outputs, batch=batch)
@@ -777,7 +718,6 @@ def validate(
             "mel_before_loss": float(losses["mel_before_loss"].item()),
             "mel_after_loss": float(losses["mel_after_loss"].item()),
             "guided_attn_weight": float(guided_attn_weight),
-            "teacher_forcing_ratio": 1.0,
         }
         metrics.update(compute_gate_metrics(outputs["gate"], batch["gate_target"], batch["output_lengths"]))
         metrics.update(compute_attention_metrics(outputs["alignments"], batch["text_lengths"], batch["output_lengths"]))
@@ -786,6 +726,7 @@ def validate(
         for key, value in metrics.items():
             totals[key] += float(value)
         n_batches += 1
+        del outputs, losses, metrics, batch
 
     if n_batches == 0:
         model.train()
@@ -793,7 +734,7 @@ def validate(
 
     metrics = {key: value / n_batches for key, value in totals.items()}
     if autoregressive_batch is not None:
-        metrics.update(compute_autoregressive_metrics(model, autoregressive_batch))
+        metrics.update(compute_autoregressive_metrics(model, autoregressive_batch, device))
 
     model.train()
     return metrics
@@ -859,7 +800,6 @@ def main() -> None:
     ).to(device)
 
     guided_attn_scheduler = GuidedAttentionScheduler()
-    teacher_forcing_scheduler = TeacherForcingScheduler()
 
     log_dir = create_experiment_log_dir(get_log_dir(), prefix="mamba")
     writer = SummaryWriter(log_dir=str(log_dir))
@@ -882,6 +822,8 @@ def main() -> None:
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size  : {len(val_dataset)}")
     print(f"Log dir           : {log_dir}")
+    print(f"Decoder type      : {hp_get('mamba_decoder_type', 'mamba')}")
+    print("Mamba block       : Mamba3")
     print(f"Optimizer         : AdamW")
     print(f"Base LR           : {float(hp.lr):.2e}")
     print(
@@ -894,7 +836,6 @@ def main() -> None:
     print(f"Clip grad norm    : {get_clip_grad_norm():.2f}")
     print(f"Guided attn w     : {guided_attn_scheduler.start_value:.3f} -> {guided_attn_scheduler.end_value:.3f}")
     print(f"Guided attn sigma : {get_guided_attn_sigma():.3f}")
-    print(f"Teacher forcing   : {teacher_forcing_scheduler.start_value:.3f} -> {teacher_forcing_scheduler.end_value:.3f}")
     print(
         "LR schedule       : "
         f"linear warmup {get_lr_warmup_epochs()} epochs, "
@@ -912,7 +853,6 @@ def main() -> None:
         )
         
         current_guided_attn_weight = guided_attn_scheduler.get_weight(epoch)
-        current_teacher_forcing_ratio = teacher_forcing_scheduler.get_ratio(epoch)
 
         pbar = tqdm(train_loader, desc=f"epoch {epoch_index}/{hp.epochs}")
         train_epoch_metrics = []
@@ -930,7 +870,6 @@ def main() -> None:
                 device=device,
                 amp_device_type=amp_device_type,
                 guided_attn_weight=current_guided_attn_weight,
-                teacher_forcing_ratio=current_teacher_forcing_ratio,
             )
             last_outputs = outputs
             train_epoch_metrics.append(stats)
@@ -943,7 +882,6 @@ def main() -> None:
                 sharp=f"{stats['attention_sharpness']:.4f}",
                 melE=f"{stats['mel_after_energy']:.4f}",
                 gaw=f"{stats['guided_attn_weight']:.3f}",
-                tf=f"{stats['teacher_forcing_ratio']:.3f}",
                 lr=f"{current_lr:.2e}",
             )
 
@@ -957,7 +895,6 @@ def main() -> None:
             f"sharp={train_stats['attention_sharpness']:.4f} "
             f"melE={train_stats['mel_after_energy']:.4f} "
             f"gaw={train_stats['guided_attn_weight']:.3f} "
-            f"tf={train_stats['teacher_forcing_ratio']:.3f} "
             f"lr={current_lr:.2e}"
         )
 
@@ -991,7 +928,6 @@ def main() -> None:
                 f"sharp={val_stats['attention_sharpness']:.4f} "
                 f"melE={val_stats['mel_after_energy']:.4f} "
                 f"gaw={val_stats['guided_attn_weight']:.3f} "
-                f"tf={val_stats['teacher_forcing_ratio']:.3f} "
                 f"acc={val_stats['accuracy']:.4f} "
                 f"ar_len={val_stats['ar_length_ratio']:.3f} "
                 f"ar_cov={val_stats['ar_text_coverage']:.3f} "
