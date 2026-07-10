@@ -712,10 +712,11 @@ def train_one_step(
 def compute_autoregressive_metrics(
     model: nn.Module,
     batch: Dict[str, torch.Tensor],
+    device: torch.device,
 ) -> Dict[str, float]:
     model_w = unwrap_model(model)
-    text = batch["text"][:1]
-    text_lengths = batch["text_lengths"][:1]
+    text = batch["text"][:1].to(device)
+    text_lengths = batch["text_lengths"][:1].to(device)
     target_frames = int(batch["output_lengths"][0].item())
 
     outputs = model_w.inference(text=text, text_lengths=text_lengths)
@@ -758,7 +759,11 @@ def validate(
     for batch in tqdm(dataloader, desc="validation", leave=False):
         batch = move_batch_to_device(batch, device)
         if autoregressive_batch is None:
-            autoregressive_batch = batch
+            autoregressive_batch = {
+                "text": batch["text"][:1].detach().cpu(),
+                "text_lengths": batch["text_lengths"][:1].detach().cpu(),
+                "output_lengths": batch["output_lengths"][:1].detach().cpu(),
+            }
         with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
             outputs = model(
                 text=batch["text"],
@@ -793,6 +798,7 @@ def validate(
         for key, value in metrics.items():
             totals[key] += float(value)
         n_batches += 1
+        del outputs, losses, metrics, batch
 
     if n_batches == 0:
         model.train()
@@ -800,7 +806,7 @@ def validate(
 
     metrics = {key: value / n_batches for key, value in totals.items()}
     if autoregressive_batch is not None:
-        metrics.update(compute_autoregressive_metrics(model, autoregressive_batch))
+        metrics.update(compute_autoregressive_metrics(model, autoregressive_batch, device))
 
     model.train()
     return metrics

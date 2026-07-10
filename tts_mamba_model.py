@@ -834,6 +834,7 @@ class MambaTacotron2(nn.Module):
             dropout=float(hp_get("mamba_prenet_dropout", 0.5)),
         )
         self.mamba_step_context_feedback = bool(hp_get("mamba_step_context_feedback", True))
+        self.uses_mutable_step_cache = block_type == "mamba3"
         self.mamba_step_input_projection = nn.Sequential(
             nn.Linear(self.d_model * 2, self.d_model),
             nn.LayerNorm(self.d_model),
@@ -1227,6 +1228,15 @@ class MambaTacotron2(nn.Module):
             mel_outputs.append(self.mel_proj(x))
             gate_outputs.append(self.gate_proj(x).squeeze(-1))
             alignments.append(attention_weights.unsqueeze(1))
+            if self.uses_mutable_step_cache:
+                # Mamba3.step uses mutable state buffers.  Treat recurrent
+                # attention/context state the same way between decoder steps:
+                # current-step gradients are preserved through the appended
+                # outputs above, but the next step starts from detached state
+                # instead of keeping a full-history autograd chain alive.
+                attention_weights = attention_weights.detach()
+                attention_weights_cum = attention_weights_cum.detach()
+                attention_context = attention_context.detach()
 
         return (
             torch.cat(mel_outputs, dim=1),
