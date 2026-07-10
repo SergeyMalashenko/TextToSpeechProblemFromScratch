@@ -227,6 +227,44 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
+def format_cuda_memory(prefix: str) -> str:
+    if not torch.cuda.is_available():
+        return f"{prefix} cuda_mem=unavailable"
+
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    max_allocated = torch.cuda.max_memory_allocated()
+    max_reserved = torch.cuda.max_memory_reserved()
+    mib = 1024.0 * 1024.0
+    report = (
+        f"{prefix} "
+        f"cuda_alloc={allocated / mib:.1f}MiB "
+        f"cuda_reserved={reserved / mib:.1f}MiB "
+        f"cuda_max_alloc={max_allocated / mib:.1f}MiB "
+        f"cuda_max_reserved={max_reserved / mib:.1f}MiB"
+    )
+    compile_cache_size = get_mamba3_step_compile_cache_size()
+    if compile_cache_size is not None:
+        report += f" mamba3_step_compile_cache={compile_cache_size}"
+    return report
+
+
+def get_mamba3_step_compile_cache_size() -> Optional[int]:
+    try:
+        from mamba_ssm.ops.cute.mamba3 import mamba3_step_fn as mamba3_step_module
+    except Exception:
+        return None
+
+    step_fn = getattr(mamba3_step_module, "mamba3_step_fn", None)
+    compile_cache = getattr(step_fn, "compile_cache", None)
+    if compile_cache is None:
+        return None
+    try:
+        return len(compile_cache)
+    except TypeError:
+        return None
+
+
 def adjust_learning_rate(
     optimizer: torch.optim.Optimizer,
     step_num: int,
@@ -920,6 +958,9 @@ def main() -> None:
     for epoch in range(start_epoch, hp.epochs):
         model.train()
         epoch_index = epoch + 1
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        print(format_cuda_memory(f"[MEM epoch={epoch_index} start]"))
         
         current_lr = get_lr_by_epoch(
             optimizer,
@@ -975,6 +1016,7 @@ def main() -> None:
             f"tf={train_stats['teacher_forcing_ratio']:.3f} "
             f"lr={current_lr:.2e}"
         )
+        print(format_cuda_memory(f"[MEM epoch={epoch_index} after_train]"))
 
         for key, value in train_stats.items():
             writer.add_scalar(f"train/{key}", value, epoch_index)
@@ -1014,6 +1056,7 @@ def main() -> None:
             )
             for key, value in val_stats.items():
                 writer.add_scalar(f"val/{key}", value, epoch_index)
+            print(format_cuda_memory(f"[MEM epoch={epoch_index} after_val]"))
 
         if epoch_index % get_sample_every_epoch() == 0:
             save_validation_sample(
@@ -1023,6 +1066,7 @@ def main() -> None:
                 save_dir=sample_dir,
                 epoch_index=epoch_index,
             )
+            print(format_cuda_memory(f"[MEM epoch={epoch_index} after_sample]"))
 
         if epoch_index % get_save_every_epoch() == 0:
             ckpt_path = checkpoint_dir / f"checkpoint_mamba_tacotron2_epoch_{epoch_index:04d}.pth.tar"
@@ -1036,6 +1080,7 @@ def main() -> None:
             )
             cleanup_old_checkpoints(checkpoint_dir, keep_last_n=get_max_checkpoints_to_keep())
             print(f"Saved checkpoint: {ckpt_path}")
+            print(format_cuda_memory(f"[MEM epoch={epoch_index} after_checkpoint]"))
 
     writer.close()
 
