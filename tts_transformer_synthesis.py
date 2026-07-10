@@ -135,13 +135,13 @@ def resolve_simple_vocoder_checkpoint(arg_value: str | None) -> Path:
     if arg_value: return Path(arg_value)
     step = hp_get("restore_simple_vocoder_step", hp_get("restore_vocoder_step", None))
     if step is None: raise ValueError("Simple vocoder checkpoint is not provided. Use --vocoder_ckpt.")
-    return Path(hp_get("simple_vocoder_checkpoint_path", "./checkpoint_vocoder")) / f"checkpoint_vocoder_{step}.pth"
+    return Path(hp_get("simple_vocoder_checkpoint_path", "./outputs/checkpoints/vocoder")) / f"checkpoint_vocoder_{step}.pth"
 
 def resolve_hifigan_checkpoint(arg_value: str | None) -> Path:
     if arg_value: return Path(arg_value)
     step = hp_get("restore_hifigan_step", None)
     if step is None: raise ValueError("HiFi-GAN checkpoint is not provided. Use --hifigan_ckpt.")
-    return Path(hp_get("hifigan_checkpoint_path", "./checkpoint_hifigan")) / f"checkpoint_hifigan_{step}.pth.tar"
+    return Path(hp_get("hifigan_checkpoint_path", "./outputs/checkpoints/hifigan")) / f"checkpoint_hifigan_{step}.pth.tar"
 
 def load_transformer_model(transformer_ckpt: str | Path, device: torch.device, strict: bool = True) -> TransformerTacotron2:
     model = TransformerTacotron2().to(device).eval()

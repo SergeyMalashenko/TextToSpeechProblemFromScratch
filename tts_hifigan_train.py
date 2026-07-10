@@ -170,7 +170,7 @@ def main() -> None:
 
     mel_basis = build_mel_basis(device=device, dtype=torch.float32)
 
-    checkpoint_dir = Path(hp_get("hifigan_checkpoint_path", "./checkpoint_hifigan"))
+    checkpoint_dir = Path(hp_get("hifigan_checkpoint_path", "./outputs/checkpoints/hifigan"))
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     lambda_fm = float(hp_get("hifigan_lambda_fm", 2.0))

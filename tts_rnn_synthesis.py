@@ -224,7 +224,7 @@ def resolve_tacotron_checkpoint(arg_value: str | None) -> Path:
 
     restore_epoch = hp_get("restore_epoch1", None)
     if restore_epoch is not None:
-        return Path(hp.checkpoint_path) / f"checkpoint_tacotron2_epoch_{int(restore_epoch):06d}.pth.tar"
+        return Path(hp.checkpoint_path) / f"checkpoint_rnn_tacotron2_epoch_{int(restore_epoch):04d}.pth.tar"
 
     raise ValueError("Tacotron checkpoint is not provided. Use --tacotron_ckpt or set restore_epoch1.")
 
@@ -244,7 +244,7 @@ def resolve_vocoder_checkpoint(arg_value: str | None) -> Path:
     step = hp_get("restore_simple_vocoder_step", hp_get("restore_vocoder_step", None))
     if step is None:
         raise ValueError("Simple vocoder checkpoint is not provided. Use --vocoder_ckpt.")
-    return Path(hp_get("simple_vocoder_checkpoint_path", "./checkpoint_vocoder")) / f"checkpoint_vocoder_{step}.pth.tar"
+    return Path(hp_get("simple_vocoder_checkpoint_path", "./outputs/checkpoints/vocoder")) / f"checkpoint_vocoder_{step}.pth.tar"
 
 
 def resolve_hifigan_checkpoint(arg_value: str | None) -> Path:
@@ -253,7 +253,7 @@ def resolve_hifigan_checkpoint(arg_value: str | None) -> Path:
     step = hp_get("restore_hifigan_step", None)
     if step is None:
         raise ValueError("HiFi-GAN checkpoint is not provided. Use --hifigan_ckpt.")
-    return Path(hp_get("hifigan_checkpoint_path", "./checkpoint_hifigan")) / f"checkpoint_hifigan_{step}.pth.tar"
+    return Path(hp_get("hifigan_checkpoint_path", "./outputs/checkpoints/hifigan")) / f"checkpoint_hifigan_{step}.pth.tar"
 
 
 def load_tacotron(path: str | Path, device: torch.device, strict: bool) -> Tacotron2:

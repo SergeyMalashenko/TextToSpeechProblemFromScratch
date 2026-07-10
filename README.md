@@ -8,14 +8,14 @@ training, and standalone synthesis scripts.
 
 - RNN Tacotron2 acoustic model
 - Transformer Tacotron acoustic model
-- Mamba Tacotron-style acoustic model
+- Mamba3 Tacotron-style acoustic model
 - MelToMag model for Griffin-Lim synthesis
 - Simple neural vocoder
 - HiFi-GAN-style vocoder
 - Shared dataset, text normalization, losses, and seeding utilities
 
-The Mamba path is experimental. It requires `mamba-ssm` and is intended for
-research comparison rather than as the most reliable synthesis path.
+The Mamba path uses Mamba3 blocks from `mamba-ssm`. It is intended for research
+comparison with the RNN and Transformer acoustic models.
 
 ## Configuration Files
 
@@ -53,21 +53,38 @@ data/LJSpeech-1.1/features/*.mag.npy
 
 ```bash
 python tts_rnn_train.py
-tensorboard --logdir ./logs/rnn_tacotron
+tensorboard --logdir ./outputs/logs/rnn
 ```
 
 ### Transformer Tacotron
 
 ```bash
 python tts_transformer_train.py
-tensorboard --logdir ./logs/transformer_tacotron
+tensorboard --logdir ./outputs/logs/transformer
 ```
 
-### Mamba Tacotron-Style Model
+### Mamba3 Tacotron-Style Model
 
 ```bash
 python tts_mamba_train.py
-tensorboard --logdir ./logs/mamba_tacotron
+tensorboard --logdir ./outputs/logs/mamba
+```
+
+RNN, Transformer, and Mamba training scripts use the same external workflow:
+
+```text
+outputs/
+  checkpoints/{rnn,transformer,mamba,mel2mag,vocoder,hifigan}/
+  logs/{rnn,transformer,mamba}/
+  samples/{rnn,transformer,mamba}/
+  synthesis/{rnn,transformer,mamba}/
+```
+
+All three acoustic trainers print aligned epoch summaries:
+
+```text
+[TRAIN epoch=N] loss=... mel=... gate=... attn=... sharp=... melE=... gaw=... lr=...
+[VAL epoch=N]   loss=... mel=... gate=... attn=... sharp=... melE=... gaw=... acc=... ar_len=... ar_cov=... ar_back=...
 ```
 
 ### MelToMag
@@ -107,8 +124,8 @@ All synthesis scripts support these waveform backends:
 python tts_rnn_synthesis.py \
   --backend griffinlim \
   --text "Hello world" \
-  --tacotron_ckpt ./checkpoint/checkpoint_tacotron2_100000.pth.tar \
-  --mel2mag_ckpt ./checkpoint/checkpoint_mel2mag_50000.pth.tar
+  --tacotron_ckpt ./outputs/checkpoints/rnn/checkpoint_rnn_tacotron2_epoch_0100.pth.tar \
+  --mel2mag_ckpt ./outputs/checkpoints/mel2mag/checkpoint_mel2mag_50000.pth.tar
 ```
 
 ### Transformer Tacotron
@@ -117,18 +134,18 @@ python tts_rnn_synthesis.py \
 python tts_transformer_synthesis.py \
   --backend hifigan \
   --text "Hello world" \
-  --transformer_ckpt ./checkpoint/checkpoint_transformer_tacotron2_epoch_0100.pth.tar \
-  --hifigan_ckpt ./checkpoint_hifigan/checkpoint_hifigan_50000.pth.tar
+  --transformer_ckpt ./outputs/checkpoints/transformer/checkpoint_transformer_tacotron2_epoch_0100.pth.tar \
+  --hifigan_ckpt ./outputs/checkpoints/hifigan/checkpoint_hifigan_50000.pth.tar
 ```
 
-### Mamba Tacotron-Style Model
+### Mamba3 Tacotron-Style Model
 
 ```bash
 python tts_mamba_synthesis.py \
   --backend griffinlim \
   --text "Hello world" \
-  --mamba_ckpt ./checkpoint/mamba_tacotron/checkpoint_mamba_tacotron2_epoch_0100.pth.tar \
-  --mel2mag_ckpt ./checkpoint/checkpoint_mel2mag_50000.pth.tar
+  --mamba_ckpt ./outputs/checkpoints/mamba/checkpoint_mamba_tacotron2_epoch_0100.pth.tar \
+  --mel2mag_ckpt ./outputs/checkpoints/mel2mag/checkpoint_mel2mag_50000.pth.tar
 ```
 
 License-plate spelling example:
@@ -138,8 +155,8 @@ python tts_mamba_synthesis.py \
   --backend hifigan \
   --text "B374KH50" \
   --spell_plate \
-  --mamba_ckpt ./checkpoint/mamba_tacotron/checkpoint_mamba_tacotron2_epoch_0100.pth.tar \
-  --hifigan_ckpt ./checkpoint_hifigan/checkpoint_hifigan_50000.pth.tar
+  --mamba_ckpt ./outputs/checkpoints/mamba/checkpoint_mamba_tacotron2_epoch_0100.pth.tar \
+  --hifigan_ckpt ./outputs/checkpoints/hifigan/checkpoint_hifigan_50000.pth.tar
 ```
 
 ## Notes
@@ -157,6 +174,5 @@ python tts_mamba_synthesis.py \
 - No dependency lockfile is included yet. Install the Python stack used by the
   scripts: PyTorch, NumPy, pandas, librosa, SciPy, tqdm, matplotlib, soundfile,
   Unidecode, inflect, TensorBoard, and optionally `mamba-ssm`.
-- Mamba synthesis quality is experimental and sensitive to train/inference
-  mismatch, teacher forcing schedule, and attention formation.
+- Mamba synthesis requires a `mamba-ssm` build that provides Mamba3.
 - HiFi-GAN training uses the repository's current experimental vocoder path.

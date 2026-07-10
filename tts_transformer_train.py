@@ -453,7 +453,43 @@ def train_one_step(model: nn.Module, criterion: Tacotron2Loss, optimizer: torch.
     metrics.update(compute_gate_metrics(outputs["gate"].detach(), batch["gate_target"], batch["output_lengths"]))
     metrics.update(compute_attention_metrics(outputs["alignments"].detach(), batch["text_lengths"], batch["output_lengths"]))
     metrics.update(compute_mel_metrics(outputs["mel_before"].detach(), outputs["mel_after"].detach(), batch["mel_target"], batch["output_lengths"]))
-    return outputs, metrics
+    log_outputs = {
+        "alignments": outputs["alignments"].detach().cpu(),
+    }
+    return log_outputs, metrics
+
+
+@torch.no_grad()
+def compute_autoregressive_metrics(
+    model: nn.Module,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+) -> Dict[str, float]:
+    model_w = unwrap_model(model)
+    text = batch["text"][:1].to(device)
+    text_lengths = batch["text_lengths"][:1].to(device)
+    target_frames = int(batch["output_lengths"][0].item())
+
+    outputs = model_w.inference(text=text, text_lengths=text_lengths)
+    alignments = outputs["alignments"][0]
+    gate = outputs["gate"][0]
+    generated_frames = int(alignments.size(0))
+    text_length = int(text_lengths[0].item())
+
+    valid_alignments = alignments[:, :text_length]
+    positions = valid_alignments.argmax(dim=-1)
+    backward_jumps = (positions[1:] < positions[:-1]).float().mean() if positions.numel() > 1 else positions.new_tensor(0.0)
+    final_position = int(positions[-1].item()) if positions.numel() > 0 else 0
+    coverage = (final_position + 1) / max(1, text_length)
+
+    return {
+        "ar_generated_frames": float(generated_frames),
+        "ar_target_frames": float(target_frames),
+        "ar_length_ratio": float(generated_frames / max(1, target_frames)),
+        "ar_gate_last_prob": float(torch.sigmoid(gate[-1]).item()) if gate.numel() > 0 else 0.0,
+        "ar_text_coverage": float(coverage),
+        "ar_backward_jump_rate": float(backward_jumps.item()),
+    }
 
 
 @torch.no_grad()
@@ -462,9 +498,16 @@ def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader,
     set_guided_attn_weight(criterion, guided_attn_weight)
     totals = defaultdict(float)
     n_batches = 0
+    autoregressive_batch = None
 
     for batch in tqdm(dataloader, desc="validation", leave=False):
         batch = move_batch_to_device(batch, device)
+        if autoregressive_batch is None:
+            autoregressive_batch = {
+                "text": batch["text"][:1].detach().cpu(),
+                "text_lengths": batch["text_lengths"][:1].detach().cpu(),
+                "output_lengths": batch["output_lengths"][:1].detach().cpu(),
+            }
         with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
             outputs = model(
                 text=batch["text"],
@@ -500,7 +543,10 @@ def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader,
     model.train()
     if n_batches == 0:
         return {"loss": 0.0}
-    return {key: value / n_batches for key, value in totals.items()}
+    metrics = {key: value / n_batches for key, value in totals.items()}
+    if autoregressive_batch is not None:
+        metrics.update(compute_autoregressive_metrics(model, autoregressive_batch, device))
+    return metrics
 
 
 def main() -> None:
@@ -693,7 +739,10 @@ def main() -> None:
                 f"sharp={val_metrics['attention_sharpness']:.4f} "
                 f"melE={val_metrics['mel_after_energy']:.4f} "
                 f"gaw={val_metrics['guided_attn_weight']:.3f} "
-                f"acc={val_metrics['accuracy']:.4f}"
+                f"acc={val_metrics['accuracy']:.4f} "
+                f"ar_len={val_metrics['ar_length_ratio']:.3f} "
+                f"ar_cov={val_metrics['ar_text_coverage']:.3f} "
+                f"ar_back={val_metrics['ar_backward_jump_rate']:.3f}"
             )
 
             for key, value in val_metrics.items():

@@ -61,12 +61,13 @@ attention_peak_threshold = 0.6
 val_ratio = 0.02
 
 # =============================================================================
-# Logging / checkpoints
+# Epoch-based workflow cadence
 # =============================================================================
 
-image_step = 500
-save_step = 2000
-sample_step = 2000
+val_every_epoch = 1
+image_every_epoch = 1
+sample_every_epoch = 5
+checkpoint_every_epoch = 1
 
 max_checkpoints_to_keep = 5
 

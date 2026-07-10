@@ -109,7 +109,7 @@ def main() -> None:
     model = SimpleVocoder().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(hp_get("vocoder_lr", 2e-4)), betas=(0.8, 0.99))
 
-    checkpoint_dir = Path(hp_get("vocoder_checkpoint_path", "./checkpoint_vocoder"))
+    checkpoint_dir = Path(hp_get("simple_vocoder_checkpoint_path", "./outputs/checkpoints/vocoder"))
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     save_every = int(hp_get("vocoder_save_step", 5000))

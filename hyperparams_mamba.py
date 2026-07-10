@@ -101,7 +101,7 @@ lr_min = 1e-5
 # Resume / restore
 # =============================================================================
 
-#resume_mamba_checkpoint = "outputs/checkpoints/mamba3_step/checkpoint_mamba_tacotron2_epoch_0071.pth.tar"
+#resume_mamba_checkpoint = "outputs/checkpoints/mamba/checkpoint_mamba_tacotron2_epoch_0071.pth.tar"
 resume_mamba_checkpoint = None 
 
 # =============================================================================
@@ -121,10 +121,10 @@ image_every_epoch = log_alignment_every_epoch
 # Output paths
 # =============================================================================
 
-checkpoint_path = "./outputs/checkpoints/mamba3_step"
+checkpoint_path = "./outputs/checkpoints/mamba"
 mel2mag_checkpoint_path = "./outputs/checkpoints/mel2mag"
-mamba_log_dir = "./outputs/logs/mamba3_step"
-sample_path = "./outputs/samples/mamba3_step"
-synthesis_path = "./outputs/synthesis/mamba3_step"
-log_dir = "./outputs/logs/mamba3_step"
+mamba_log_dir = "./outputs/logs/mamba"
+sample_path = "./outputs/samples/mamba"
+synthesis_path = "./outputs/synthesis/mamba"
+log_dir = "./outputs/logs/mamba"
 max_checkpoints_to_keep = 5

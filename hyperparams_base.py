@@ -107,6 +107,7 @@ vocoder_save_step = 5000
 resume_vocoder_checkpoint = None
 restore_simple_vocoder_step = None
 restore_vocoder_step = None
+simple_vocoder_checkpoint_path = "./outputs/checkpoints/vocoder"
 
 
 # =============================================================================
@@ -122,6 +123,7 @@ hifigan_val_step = 2000
 
 hifigan_lambda_fm = 2.0
 hifigan_lambda_mel = 45.0
+hifigan_checkpoint_path = "./outputs/checkpoints/hifigan"
 
 # The product of the upsample rates should match hop_length.
 # For sr = 22050 and frame_shift = 0.0125:

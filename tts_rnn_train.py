@@ -63,18 +63,6 @@ def get_gate_pos_weight() -> float:
     return float(hp_get("gate_pos_weight", 5.0))
 
 
-def get_log_alignment_every() -> int:
-    return int(hp_get("image_step", 500))
-
-
-def get_checkpoint_every() -> int:
-    return int(hp_get("save_step", 2000))
-
-
-def get_sample_every() -> int:
-    return int(hp_get("sample_step", get_checkpoint_every()))
-
-
 def get_max_checkpoints_to_keep() -> int:
     return int(hp_get("max_checkpoints_to_keep", 5))
 
@@ -210,6 +198,14 @@ def get_val_every_epoch() -> int:
 
 def get_image_every_epoch() -> int:
     return int(hp_get("image_every_epoch", 1))
+
+
+def get_sample_every_epoch() -> int:
+    return int(hp_get("sample_every_epoch", 5))
+
+
+def get_checkpoint_every_epoch() -> int:
+    return int(hp_get("checkpoint_every_epoch", 5))
 
 
 # =============================================================================
@@ -434,7 +430,10 @@ def cleanup_old_checkpoints(checkpoint_dir: str | Path, keep_last_n: int) -> Non
     if not checkpoint_dir.exists():
         return
 
-    checkpoints = sorted(checkpoint_dir.glob("checkpoint_tacotron2_*.pth.tar"), key=lambda p: p.stat().st_mtime)
+    checkpoints = sorted(
+        checkpoint_dir.glob("checkpoint_rnn_tacotron2_epoch_*.pth.tar"),
+        key=lambda p: p.stat().st_mtime,
+    )
     if len(checkpoints) <= keep_last_n:
         return
 
@@ -505,7 +504,7 @@ def save_validation_sample(
     dataset,
     device: torch.device,
     save_dir: str | Path,
-    global_step: int,
+    epoch_index: int,
 ) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -523,8 +522,8 @@ def save_validation_sample(
     mel = outputs["mel_after"][0].detach().cpu()
     align = outputs["alignments"][0].detach().cpu()
 
-    torch.save(mel, save_dir / f"sample_mel_step_{global_step}.pt")
-    torch.save(align, save_dir / f"sample_align_step_{global_step}.pt")
+    torch.save(mel, save_dir / f"rnn_sample_mel_epoch_{epoch_index:04d}.pt")
+    torch.save(align, save_dir / f"rnn_sample_align_epoch_{epoch_index:04d}.pt")
 
 
 # =============================================================================
@@ -587,7 +586,43 @@ def train_one_step(
         **attention_metrics,
         **mel_metrics,
     }
-    return outputs, stats
+    log_outputs = {
+        "alignments": outputs["alignments"].detach().cpu(),
+    }
+    return log_outputs, stats
+
+
+@torch.no_grad()
+def compute_autoregressive_metrics(
+    model: nn.Module,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+) -> Dict[str, float]:
+    model_w = unwrap_model(model)
+    text = batch["text"][:1].to(device)
+    text_lengths = batch["text_lengths"][:1].to(device)
+    target_frames = int(batch["output_lengths"][0].item())
+
+    outputs = model_w.inference(text=text, text_lengths=text_lengths)
+    alignments = outputs["alignments"][0]
+    gate = outputs["gate"][0]
+    generated_frames = int(alignments.size(0))
+    text_length = int(text_lengths[0].item())
+
+    valid_alignments = alignments[:, :text_length]
+    positions = valid_alignments.argmax(dim=-1)
+    backward_jumps = (positions[1:] < positions[:-1]).float().mean() if positions.numel() > 1 else positions.new_tensor(0.0)
+    final_position = int(positions[-1].item()) if positions.numel() > 0 else 0
+    coverage = (final_position + 1) / max(1, text_length)
+
+    return {
+        "ar_generated_frames": float(generated_frames),
+        "ar_target_frames": float(target_frames),
+        "ar_length_ratio": float(generated_frames / max(1, target_frames)),
+        "ar_gate_last_prob": float(torch.sigmoid(gate[-1]).item()) if gate.numel() > 0 else 0.0,
+        "ar_text_coverage": float(coverage),
+        "ar_backward_jump_rate": float(backward_jumps.item()),
+    }
 
 
 @torch.no_grad()
@@ -602,9 +637,16 @@ def validate(
 
     totals = defaultdict(float)
     n_batches = 0
+    autoregressive_batch = None
 
     for batch in tqdm(dataloader, desc="validation", leave=False):
         batch = move_batch_to_device(batch, device)
+        if autoregressive_batch is None:
+            autoregressive_batch = {
+                "text": batch["text"][:1].detach().cpu(),
+                "text_lengths": batch["text_lengths"][:1].detach().cpu(),
+                "output_lengths": batch["output_lengths"][:1].detach().cpu(),
+            }
 
         with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
             outputs = model(
@@ -635,7 +677,10 @@ def validate(
 
     if n_batches == 0:
         return {"loss": 0.0}
-    return {key: value / n_batches for key, value in totals.items()}
+    metrics = {key: value / n_batches for key, value in totals.items()}
+    if autoregressive_batch is not None:
+        metrics.update(compute_autoregressive_metrics(model, autoregressive_batch, device))
+    return metrics
 
 
 # =============================================================================
@@ -785,28 +830,6 @@ def main() -> None:
                 lr=f"{current_lr:.2e}",
             )
 
-            if global_step % get_checkpoint_every() == 0:
-                ckpt_path = checkpoint_dir / f"checkpoint_tacotron2_{global_step}.pth.tar"
-                save_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                    epoch=epoch,
-                    global_step=global_step,
-                    path=ckpt_path,
-                )
-                cleanup_old_checkpoints(checkpoint_dir, keep_last_n=get_max_checkpoints_to_keep())
-                print(f"Saved checkpoint: {ckpt_path}")
-
-            if global_step % get_sample_every() == 0:
-                save_validation_sample(
-                    model=model,
-                    dataset=full_dataset,
-                    device=device,
-                    save_dir=sample_dir,
-                    global_step=global_step,
-                )
-
         train_metrics = average_metric_dict(train_epoch_metrics)
         if train_metrics:
             print(
@@ -833,6 +856,28 @@ def main() -> None:
                 tag="attention/rnn_alignment",
             )
 
+        if (epoch + 1) % get_sample_every_epoch() == 0:
+            save_validation_sample(
+                model=model,
+                dataset=val_dataset,
+                device=device,
+                save_dir=sample_dir,
+                epoch_index=epoch_idx,
+            )
+
+        if (epoch + 1) % get_checkpoint_every_epoch() == 0:
+            ckpt_path = checkpoint_dir / f"checkpoint_rnn_tacotron2_epoch_{epoch_idx:04d}.pth.tar"
+            save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch_idx,
+                global_step=global_step,
+                path=ckpt_path,
+            )
+            cleanup_old_checkpoints(checkpoint_dir, keep_last_n=get_max_checkpoints_to_keep())
+            print(f"Saved checkpoint: {ckpt_path}")
+
         if (epoch + 1) % get_val_every_epoch() == 0:
             val_metrics = validate(
                 model=model,
@@ -851,7 +896,10 @@ def main() -> None:
                 f"sharp={val_metrics['attention_sharpness']:.4f} "
                 f"melE={val_metrics['mel_after_energy']:.4f} "
                 f"gaw={val_metrics['guided_attn_weight']:.3f} "
-                f"acc={val_metrics['accuracy']:.4f}"
+                f"acc={val_metrics['accuracy']:.4f} "
+                f"ar_len={val_metrics['ar_length_ratio']:.3f} "
+                f"ar_cov={val_metrics['ar_text_coverage']:.3f} "
+                f"ar_back={val_metrics['ar_backward_jump_rate']:.3f}"
             )
 
             for key, value in val_metrics.items():
