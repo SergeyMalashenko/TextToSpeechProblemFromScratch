@@ -9,9 +9,9 @@ from hyperparams_base import *
 # =============================================================================
 
 epochs = 300
-lr = 5e-4
+lr = 4e-4
 
-batch_size = 48
+batch_size = 32
 num_workers = 32
 pin_memory = True
 val_ratio = 0.02
@@ -71,12 +71,12 @@ gate_threshold = 0.5
 # Loss
 # =============================================================================
 
-gate_pos_weight = 2.0
-guided_attn_sigma = 0.3
+gate_pos_weight = 1.0
+guided_attn_sigma = 0.4
 
 # Keep constant guided-attention pressure, same style as RNN's fixed weight.
-guided_attn_weight_start = 3.0
-guided_attn_weight_end = 3.0
+guided_attn_weight_start = 1.0
+guided_attn_weight_end = 1.0
 guided_attn_decay_start_epoch = 0
 guided_attn_decay_end_epoch = 0
 
@@ -100,16 +100,17 @@ clip_grad_norm = 1.0
 # Epoch-based LR schedule (approximate RNN warmup+decay behavior)
 # =============================================================================
 
-lr_warmup_epochs = 20
+lr_warmup_epochs = 40
 lr_step_epochs = 1
-lr_step_gamma = 0.99
+lr_step_gamma = 0.98
 lr_min = 1e-5
 
 # =============================================================================
 # Resume / restore
 # =============================================================================
 
-resume_mamba_checkpoint = None
+#resume_mamba_checkpoint = "outputs/checkpoints/mamba3_step/checkpoint_mamba_tacotron2_epoch_0071.pth.tar"
+resume_mamba_checkpoint = None 
 
 # =============================================================================
 # Workflow cadence
