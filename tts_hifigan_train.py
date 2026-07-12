@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
 import librosa
 import numpy as np
 import torch
+from scipy import signal
+from scipy.io.wavfile import write
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
@@ -63,6 +66,16 @@ def set_requires_grad(module: torch.nn.Module, requires_grad: bool) -> None:
 def build_mel_basis(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     basis = librosa.filters.mel(sr=hp.sr, n_fft=hp.n_fft, n_mels=hp.n_mels)
     return torch.tensor(basis, device=device, dtype=dtype)
+
+
+def average_metric_dict(metrics: list[dict[str, float]]) -> dict[str, float]:
+    if not metrics:
+        return {}
+    totals: dict[str, float] = defaultdict(float)
+    for item in metrics:
+        for key, value in item.items():
+            totals[key] += float(value)
+    return {key: value / len(metrics) for key, value in totals.items()}
 
 
 def wav_to_mel(wav: torch.Tensor, mel_basis: torch.Tensor) -> torch.Tensor:
@@ -142,7 +155,7 @@ def cleanup_old_checkpoints(checkpoint_dir: str | Path, keep_last_n: int) -> Non
         return
 
     checkpoints = sorted(
-        checkpoint_dir.glob("checkpoint_hifigan_*.pth.tar"),
+        checkpoint_dir.glob("checkpoint_hifigan_epoch_*.pth.tar"),
         key=lambda p: p.stat().st_mtime,
     )
     if len(checkpoints) <= keep_last_n:
@@ -183,6 +196,44 @@ def maybe_resume_from_checkpoint(
     print(f"Resumed HiFi-GAN from checkpoint: {resume_path}")
     print(f"Start epoch: {start_epoch}, global step: {global_step}")
     return start_epoch, global_step
+
+
+def de_emphasis(wav: np.ndarray) -> np.ndarray:
+    return signal.lfilter([1], [1, -float(hp.preemphasis)], wav).astype(np.float32)
+
+
+def save_wav(path: str | Path, wav: np.ndarray, sample_rate: int) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wav = np.asarray(wav, dtype=np.float32)
+    wav = np.clip(wav, -1.0, 1.0)
+    write(str(path), int(sample_rate), wav)
+
+
+@torch.no_grad()
+def save_validation_sample(
+    generator,
+    dataloader,
+    device: torch.device,
+    sample_dir: str | Path,
+    epoch_index: int,
+) -> None:
+    generator.eval()
+    batch = next(iter(dataloader))
+    mel = batch["mel"][:1].to(device, non_blocking=True)
+    wav = batch["wav"][:1].to(device, non_blocking=True)
+
+    y_hat = generator(mel.transpose(1, 2))
+    min_len = min(wav.size(-1), y_hat.size(-1))
+
+    target = wav[0, :min_len].detach().cpu().numpy()
+    pred = y_hat[0, 0, :min_len].detach().cpu().numpy()
+
+    sample_dir = Path(sample_dir)
+    save_wav(sample_dir / f"hifigan_target_epoch_{epoch_index:04d}.wav", de_emphasis(target), hp.sr)
+    save_wav(sample_dir / f"hifigan_generated_epoch_{epoch_index:04d}.wav", de_emphasis(pred), hp.sr)
+    np.save(sample_dir / f"hifigan_mel_epoch_{epoch_index:04d}.npy", mel[0].detach().cpu().numpy())
+    generator.train()
 
 
 def main() -> None:
@@ -240,12 +291,15 @@ def main() -> None:
     log_dir = Path(hp_get("hifigan_log_dir", "./outputs/logs/hifigan"))
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(log_dir))
+    sample_dir = Path(hp_get("hifigan_sample_path", "./outputs/samples/hifigan"))
+    sample_dir.mkdir(parents=True, exist_ok=True)
 
     lambda_fm = float(hp_get("hifigan_lambda_fm", 2.0))
     lambda_mel = float(hp_get("hifigan_lambda_mel", 45.0))
-    save_every = int(hp_get("hifigan_save_step", 5000))
-    val_every = int(hp_get("hifigan_val_step", 2000))
-    max_checkpoints_to_keep = int(hp_get("max_checkpoints_to_keep", 5))
+    save_every_epoch = int(hp_get("hifigan_save_every_epoch", 1))
+    validate_every_epoch = int(hp_get("hifigan_validate_every_epoch", 1))
+    sample_every_epoch = int(hp_get("hifigan_sample_every_epoch", 5))
+    max_checkpoints_to_keep = int(hp_get("hifigan_max_checkpoints_to_keep", 0))
 
     resume_path = hp_get("resume_hifigan_checkpoint", None)
     start_epoch, global_step = maybe_resume_from_checkpoint(
@@ -263,12 +317,19 @@ def main() -> None:
     print(f"Val dataset size   : {val_size}")
     print(f"Checkpoint dir     : {checkpoint_dir}")
     print(f"Log dir            : {log_dir}")
+    print(f"Sample dir         : {sample_dir}")
     print(f"Segment size       : {int(hp_get('hifigan_segment_size', hp.hop_length * 64))} samples")
     print(f"Segment frames     : {int(hp_get('hifigan_segment_size', hp.hop_length * 64)) // int(hp.hop_length)}")
+    print(f"Validate every     : {validate_every_epoch} epoch(s)")
+    print(f"Checkpoint every   : {save_every_epoch} epoch(s)")
+    print(f"Sample every       : {sample_every_epoch} epoch(s)")
+    print(f"Keep checkpoints   : {'all' if max_checkpoints_to_keep <= 0 else max_checkpoints_to_keep}")
     print("Target wav         : trimmed + preemphasized waveform")
 
     for epoch in range(start_epoch, int(hp_get("hifigan_epochs", 10000))):
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        epoch_index = epoch + 1
+        pbar = tqdm(train_loader, desc=f"epoch {epoch_index}/{int(hp_get('hifigan_epochs', 10000))}")
+        train_epoch_metrics = []
 
         for batch in pbar:
             global_step += 1
@@ -319,23 +380,53 @@ def main() -> None:
             set_requires_grad(mpd, True)
             set_requires_grad(msd, True)
 
-            pbar.set_postfix(g=f"{float(loss_gen.item()):.4f}", d=f"{float(loss_disc.item()):.4f}", mel=f"{float(loss_mel.item()):.4f}")
-            writer.add_scalar("train/generator_loss", float(loss_gen.item()), global_step)
-            writer.add_scalar("train/discriminator_loss", float(loss_disc.item()), global_step)
-            writer.add_scalar("train/mel_loss", float(loss_mel.item()), global_step)
-            writer.add_scalar("train/feature_matching_loss", float((loss_fm_f + loss_fm_s).item()), global_step)
+            batch_stats = {
+                "generator_loss": float(loss_gen.item()),
+                "discriminator_loss": float(loss_disc.item()),
+                "mel_loss": float(loss_mel.item()),
+                "feature_matching_loss": float((loss_fm_f + loss_fm_s).item()),
+                "adv_generator_loss": float((loss_gen_f + loss_gen_s).item()),
+            }
+            train_epoch_metrics.append(batch_stats)
+            pbar.set_postfix(
+                g=f"{batch_stats['generator_loss']:.4f}",
+                d=f"{batch_stats['discriminator_loss']:.4f}",
+                mel=f"{batch_stats['mel_loss']:.4f}",
+            )
 
-            if global_step % val_every == 0:
-                stats = validate(generator, val_loader, device, mel_basis)
-                print(f"[VAL step={global_step}] l1={stats['l1']:.6f} mel={stats['mel']:.6f}")
-                writer.add_scalar("val/l1", stats["l1"], global_step)
-                writer.add_scalar("val/mel", stats["mel"], global_step)
+        train_stats = average_metric_dict(train_epoch_metrics)
+        print(
+            f"[TRAIN epoch={epoch_index}] "
+            f"g={train_stats['generator_loss']:.4f} "
+            f"d={train_stats['discriminator_loss']:.4f} "
+            f"mel={train_stats['mel_loss']:.4f} "
+            f"fm={train_stats['feature_matching_loss']:.4f} "
+            f"adv={train_stats['adv_generator_loss']:.4f}"
+        )
+        for key, value in train_stats.items():
+            writer.add_scalar(f"train/{key}", value, epoch_index)
 
-            if global_step % save_every == 0:
-                ckpt = checkpoint_dir / f"checkpoint_hifigan_{global_step}.pth.tar"
-                save_checkpoint(generator, mpd, msd, optim_g, optim_d, epoch, global_step, ckpt)
-                cleanup_old_checkpoints(checkpoint_dir, keep_last_n=max_checkpoints_to_keep)
-                print(f"Saved checkpoint: {ckpt}")
+        if epoch_index % validate_every_epoch == 0:
+            stats = validate(generator, val_loader, device, mel_basis)
+            print(f"[VAL epoch={epoch_index}] l1={stats['l1']:.6f} mel={stats['mel']:.6f}")
+            writer.add_scalar("val/l1", stats["l1"], epoch_index)
+            writer.add_scalar("val/mel", stats["mel"], epoch_index)
+
+        if epoch_index % sample_every_epoch == 0:
+            save_validation_sample(
+                generator=generator,
+                dataloader=val_loader,
+                device=device,
+                sample_dir=sample_dir,
+                epoch_index=epoch_index,
+            )
+            print(f"Saved sample artifacts: {sample_dir}")
+
+        if epoch_index % save_every_epoch == 0:
+            ckpt = checkpoint_dir / f"checkpoint_hifigan_epoch_{epoch_index:04d}.pth.tar"
+            save_checkpoint(generator, mpd, msd, optim_g, optim_d, epoch_index, global_step, ckpt)
+            cleanup_old_checkpoints(checkpoint_dir, keep_last_n=max_checkpoints_to_keep)
+            print(f"Saved checkpoint: {ckpt}")
 
     writer.close()
 
