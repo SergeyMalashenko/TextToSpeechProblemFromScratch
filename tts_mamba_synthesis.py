@@ -370,6 +370,7 @@ def synthesize_one(
         hifigan_model.eval()
         wav_t = hifigan_model(mel_after.transpose(1, 2))
         wav = to_numpy(wav_t.squeeze(0).squeeze(0))
+        wav = signal.lfilter([1], [1, -hp.preemphasis], wav)
     else:
         raise ValueError(f"Unknown backend: {backend}")
 

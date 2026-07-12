@@ -120,6 +120,7 @@ hifigan_epochs = 10000
 hifigan_segment_size = hop_length * 64
 hifigan_save_step = 5000
 hifigan_val_step = 2000
+hifigan_log_dir = "./outputs/logs/hifigan"
 
 hifigan_lambda_fm = 2.0
 hifigan_lambda_mel = 45.0

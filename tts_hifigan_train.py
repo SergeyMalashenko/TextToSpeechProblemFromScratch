@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import librosa
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 import hyperparams_base as hp
@@ -21,6 +22,11 @@ from tts_hifigan_model import (
     discriminator_loss,
     generator_loss,
 )
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    from tensorboardX import SummaryWriter
 
 
 def hp_get(name: str, default):
@@ -46,6 +52,12 @@ def get_seed() -> int:
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+
+def set_requires_grad(module: torch.nn.Module, requires_grad: bool) -> None:
+    for param in module.parameters():
+        param.requires_grad_(requires_grad)
 
 
 def build_mel_basis(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -124,19 +136,72 @@ def save_checkpoint(generator, mpd, msd, optim_g, optim_d, epoch, global_step, p
     )
 
 
+def cleanup_old_checkpoints(checkpoint_dir: str | Path, keep_last_n: int) -> None:
+    checkpoint_dir = Path(checkpoint_dir)
+    if keep_last_n <= 0 or not checkpoint_dir.exists():
+        return
+
+    checkpoints = sorted(
+        checkpoint_dir.glob("checkpoint_hifigan_*.pth.tar"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if len(checkpoints) <= keep_last_n:
+        return
+
+    for ckpt in checkpoints[:-keep_last_n]:
+        try:
+            ckpt.unlink()
+        except OSError:
+            pass
+
+
+def maybe_resume_from_checkpoint(
+    generator,
+    mpd,
+    msd,
+    optim_g,
+    optim_d,
+    resume_path: Optional[str | Path],
+    device: torch.device,
+) -> tuple[int, int]:
+    if not resume_path:
+        return 0, 0
+
+    resume_path = Path(resume_path)
+    if not resume_path.exists():
+        raise FileNotFoundError(f"HiFi-GAN checkpoint not found: {resume_path}")
+
+    checkpoint = torch.load(resume_path, map_location=device)
+    generator.load_state_dict(checkpoint["generator"])
+    mpd.load_state_dict(checkpoint["mpd"])
+    msd.load_state_dict(checkpoint["msd"])
+    optim_g.load_state_dict(checkpoint["optim_g"])
+    optim_d.load_state_dict(checkpoint["optim_d"])
+
+    start_epoch = int(checkpoint.get("epoch", 0))
+    global_step = int(checkpoint.get("global_step", 0))
+    print(f"Resumed HiFi-GAN from checkpoint: {resume_path}")
+    print(f"Start epoch: {start_epoch}, global step: {global_step}")
+    return start_epoch, global_step
+
+
 def main() -> None:
     set_seed(get_seed())
     device = get_device()
 
-    full_dataset = get_hifigan_dataset()
+    train_source_dataset = get_hifigan_dataset(random_segments=True)
+    val_source_dataset = get_hifigan_dataset(random_segments=False)
 
-    val_size = max(1, int(len(full_dataset) * get_val_ratio()))
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(get_seed()),
-    )
+    dataset_size = len(train_source_dataset)
+    val_size = max(1, int(dataset_size * get_val_ratio()))
+    train_size = dataset_size - val_size
+
+    indices = torch.randperm(dataset_size, generator=torch.Generator().manual_seed(get_seed())).tolist()
+    val_indices = indices[:val_size]
+    train_indices = indices[val_size:]
+
+    train_dataset = Subset(train_source_dataset, train_indices)
+    val_dataset = Subset(val_source_dataset, val_indices)
 
     train_loader = DataLoader(
         train_dataset,
@@ -172,21 +237,44 @@ def main() -> None:
 
     checkpoint_dir = Path(hp_get("hifigan_checkpoint_path", "./outputs/checkpoints/hifigan"))
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = Path(hp_get("hifigan_log_dir", "./outputs/logs/hifigan"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(log_dir))
 
     lambda_fm = float(hp_get("hifigan_lambda_fm", 2.0))
     lambda_mel = float(hp_get("hifigan_lambda_mel", 45.0))
     save_every = int(hp_get("hifigan_save_step", 5000))
     val_every = int(hp_get("hifigan_val_step", 2000))
-    global_step = 0
+    max_checkpoints_to_keep = int(hp_get("max_checkpoints_to_keep", 5))
 
-    for epoch in range(int(hp_get("hifigan_epochs", 10000))):
+    resume_path = hp_get("resume_hifigan_checkpoint", None)
+    start_epoch, global_step = maybe_resume_from_checkpoint(
+        generator=generator,
+        mpd=mpd,
+        msd=msd,
+        optim_g=optim_g,
+        optim_d=optim_d,
+        resume_path=resume_path,
+        device=device,
+    )
+
+    print(f"Using device       : {device}")
+    print(f"Train dataset size : {train_size}")
+    print(f"Val dataset size   : {val_size}")
+    print(f"Checkpoint dir     : {checkpoint_dir}")
+    print(f"Log dir            : {log_dir}")
+    print(f"Segment size       : {int(hp_get('hifigan_segment_size', hp.hop_length * 64))} samples")
+    print(f"Segment frames     : {int(hp_get('hifigan_segment_size', hp.hop_length * 64)) // int(hp.hop_length)}")
+    print("Target wav         : trimmed + preemphasized waveform")
+
+    for epoch in range(start_epoch, int(hp_get("hifigan_epochs", 10000))):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
 
         for batch in pbar:
             global_step += 1
 
-            mel = batch["mel"].to(device)               # (B, T_mel, n_mels)
-            wav = batch["wav"].to(device)               # (B, T_audio)
+            mel = batch["mel"].to(device, non_blocking=True)  # (B, T_mel, n_mels)
+            wav = batch["wav"].to(device, non_blocking=True)  # (B, T_audio)
             y = wav.unsqueeze(1)                        # (B, 1, T_audio)
             y_hat = generator(mel.transpose(1, 2))      # (B, 1, T_audio)
 
@@ -195,6 +283,8 @@ def main() -> None:
             y_hat = y_hat[..., :min_len]
 
             # Discriminators
+            set_requires_grad(mpd, True)
+            set_requires_grad(msd, True)
             y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_hat.detach())
             y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_hat.detach())
 
@@ -207,6 +297,8 @@ def main() -> None:
             optim_d.step()
 
             # Generator
+            set_requires_grad(mpd, False)
+            set_requires_grad(msd, False)
             y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_hat)
             y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_hat)
 
@@ -224,17 +316,28 @@ def main() -> None:
             optim_g.zero_grad(set_to_none=True)
             loss_gen.backward()
             optim_g.step()
+            set_requires_grad(mpd, True)
+            set_requires_grad(msd, True)
 
             pbar.set_postfix(g=f"{float(loss_gen.item()):.4f}", d=f"{float(loss_disc.item()):.4f}", mel=f"{float(loss_mel.item()):.4f}")
+            writer.add_scalar("train/generator_loss", float(loss_gen.item()), global_step)
+            writer.add_scalar("train/discriminator_loss", float(loss_disc.item()), global_step)
+            writer.add_scalar("train/mel_loss", float(loss_mel.item()), global_step)
+            writer.add_scalar("train/feature_matching_loss", float((loss_fm_f + loss_fm_s).item()), global_step)
 
             if global_step % val_every == 0:
                 stats = validate(generator, val_loader, device, mel_basis)
                 print(f"[VAL step={global_step}] l1={stats['l1']:.6f} mel={stats['mel']:.6f}")
+                writer.add_scalar("val/l1", stats["l1"], global_step)
+                writer.add_scalar("val/mel", stats["mel"], global_step)
 
             if global_step % save_every == 0:
                 ckpt = checkpoint_dir / f"checkpoint_hifigan_{global_step}.pth.tar"
                 save_checkpoint(generator, mpd, msd, optim_g, optim_d, epoch, global_step, ckpt)
+                cleanup_old_checkpoints(checkpoint_dir, keep_last_n=max_checkpoints_to_keep)
                 print(f"Saved checkpoint: {ckpt}")
+
+    writer.close()
 
 
 if __name__ == "__main__":

@@ -13,6 +13,11 @@ import hyperparams_base as hp
 from text import text_to_sequence
 
 try:
+    import librosa
+except ImportError:  # required only for HiFi-GAN variant-A waveform targets
+    librosa = None
+
+try:
     import soundfile as sf
 except ImportError:  # optional fallback
     sf = None
@@ -119,6 +124,24 @@ def load_wav(path: str | Path) -> np.ndarray:
         wav = wav.mean(axis=1)
     if wav.ndim != 1:
         raise ValueError(f"Expected mono waveform or stereo waveform, got shape {wav.shape}")
+    return wav.astype(np.float32, copy=False)
+
+def load_preemphasized_trimmed_wav(path: str | Path) -> np.ndarray:
+    """
+    Load waveform with the same front-end used by data_pipeline.wav_to_spectrograms.
+
+    Current acoustic models are trained to predict normalized mel features produced
+    from trimmed + preemphasized audio. HiFi-GAN variant A uses those mel features
+    directly as conditioning, so its waveform target must live on the same time and
+    preemphasis axis.
+    """
+    if librosa is None:
+        raise ImportError("Install librosa to load HiFi-GAN variant-A waveform targets")
+    wav, _ = librosa.load(str(path), sr=int(hp.sr))
+    wav, _ = librosa.effects.trim(wav)
+    if wav.size == 0:
+        return wav.astype(np.float32)
+    wav = np.append(wav[0], wav[1:] - float(hp.preemphasis) * wav[:-1])
     return wav.astype(np.float32, copy=False)
 
 def make_mel_input(mel: np.ndarray) -> np.ndarray:
@@ -611,6 +634,83 @@ class VocoderDataset(BaseTTSDataset):
             "wav_length": int(wav.shape[0]),
         }
 
+
+class HiFiGANDataset(BaseTTSDataset):
+    """
+    HiFi-GAN dataset for variant A:
+
+      conditioning: current normalized mel features from data_pipeline.py
+      target      : waveform after the same trim + preemphasis front-end
+
+    The dataset returns fixed-length aligned segments. This keeps discriminator
+    batches compact and prevents padded utterance tails from dominating training.
+    """
+
+    def __init__(
+        self,
+        csv_file: str | Path,
+        features_dir: str | Path,
+        wavs_dir: str | Path,
+        segment_size: int,
+        random_segments: bool = True,
+        cleaners: str | list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        super().__init__(csv_file=csv_file, features_dir=features_dir, cleaners=cleaners)
+        self.wavs_dir = Path(wavs_dir)
+        self.segment_size = int(segment_size)
+        if self.segment_size <= 0:
+            raise ValueError(f"segment_size must be positive, got {segment_size}")
+        self.segment_frames = max(1, self.segment_size // int(hp.hop_length))
+        self.segment_size = self.segment_frames * int(hp.hop_length)
+        self.random_segments = bool(random_segments)
+
+    def load_hifigan_wav_from_dir(self, utt_id: str, wavs_dir: str | Path) -> np.ndarray:
+        wav_path = make_wav_path(wavs_dir, utt_id)
+        if not wav_path.exists():
+            raise FileNotFoundError(
+                f"Missing wav file: {wav_path} (expected <wavs_dir>/<utt_id>.wav)"
+            )
+        return load_preemphasized_trimmed_wav(wav_path)
+
+    def _choose_mel_start(self, mel_length: int) -> int:
+        if mel_length <= self.segment_frames:
+            return 0
+        max_start = mel_length - self.segment_frames
+        if self.random_segments:
+            return int(np.random.randint(0, max_start + 1))
+        return 0
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        utt_id = self.get_utt_id(idx)
+        mel = self.load_mel(utt_id)
+        wav = self.load_hifigan_wav_from_dir(utt_id, self.wavs_dir)
+
+        mel_length = int(mel.shape[0])
+        mel_start = self._choose_mel_start(mel_length)
+        mel_end = mel_start + self.segment_frames
+        wav_start = mel_start * int(hp.hop_length)
+        wav_end = wav_start + self.segment_size
+
+        mel_segment = pad_2d_time(
+            mel[mel_start:mel_end],
+            target_length=self.segment_frames,
+            pad_value=0.0,
+        )
+        wav_segment = pad_1d(
+            wav[wav_start:wav_end],
+            target_length=self.segment_size,
+            pad_value=0.0,
+        )
+
+        return {
+            "utt_id": utt_id,
+            "mel": mel_segment.astype(np.float32, copy=False),
+            "wav": wav_segment.astype(np.float32, copy=False),
+            "mel_length": min(self.segment_frames, max(0, mel_length - mel_start)),
+            "wav_length": min(self.segment_size, max(0, int(wav.shape[0]) - wav_start)),
+            "mel_start": mel_start,
+        }
+
 # =============================================================================
 # Collate functions
 # =============================================================================
@@ -743,6 +843,25 @@ def collate_fn_vocoder(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor
         "wav_lengths": torch.from_numpy(wav_lengths).long(),
     }
 
+
+def collate_fn_hifigan(batch: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
+    if len(batch) == 0:
+        raise ValueError("Empty batch")
+    if not isinstance(batch[0], Mapping):
+        raise TypeError(f"batch must contain dict-like objects, got {type(batch[0])}")
+
+    mel = np.stack([x["mel"] for x in batch], axis=0).astype(np.float32, copy=False)
+    wav = np.stack([x["wav"] for x in batch], axis=0).astype(np.float32, copy=False)
+    mel_lengths = np.asarray([int(x["mel_length"]) for x in batch], dtype=np.int64)
+    wav_lengths = np.asarray([int(x["wav_length"]) for x in batch], dtype=np.int64)
+
+    return {
+        "mel": torch.from_numpy(mel).float(),
+        "wav": torch.from_numpy(wav).float(),
+        "mel_lengths": torch.from_numpy(mel_lengths).long(),
+        "wav_lengths": torch.from_numpy(wav_lengths).long(),
+    }
+
 # =============================================================================
 # Convenience builders
 # =============================================================================
@@ -780,6 +899,29 @@ def get_vocoder_dataset(
     if wavs_dir is None:
         wavs_dir = get_default_wavs_dir()
     return VocoderDataset(csv_file=csv_file, features_dir=features_dir, wavs_dir=wavs_dir)
+
+def get_hifigan_dataset(
+    csv_file: str | Path | None = None,
+    features_dir: str | Path | None = None,
+    wavs_dir: str | Path | None = None,
+    segment_size: int | None = None,
+    random_segments: bool = True,
+) -> HiFiGANDataset:
+    if csv_file is None or features_dir is None:
+        default_csv, default_features = get_default_paths()
+        csv_file = default_csv if csv_file is None else csv_file
+        features_dir = default_features if features_dir is None else features_dir
+    if wavs_dir is None:
+        wavs_dir = get_default_wavs_dir()
+    if segment_size is None:
+        segment_size = int(getattr(hp, "hifigan_segment_size", int(hp.hop_length) * 64))
+    return HiFiGANDataset(
+        csv_file=csv_file,
+        features_dir=features_dir,
+        wavs_dir=wavs_dir,
+        segment_size=segment_size,
+        random_segments=random_segments,
+    )
 
 def get_param_size(model: torch.nn.Module) -> int:
     return int(sum(p.numel() for p in model.parameters()))

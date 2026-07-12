@@ -252,6 +252,7 @@ def synthesize_one(source_text: str, transformer_model: TransformerTacotron2, ou
     elif backend == "hifigan":
         if hifigan_model is None: raise ValueError("hifigan_model is required for hifigan backend")
         wav = to_numpy(hifigan_model(mel_after.transpose(1, 2)).squeeze(0).squeeze(0))
+        wav = signal.lfilter([1], [1, -hp.preemphasis], wav)
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
