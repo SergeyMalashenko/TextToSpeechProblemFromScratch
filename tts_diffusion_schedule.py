@@ -51,23 +51,26 @@ class DiffusionSchedule:
         model.eval()
         device = mel.device
         x = torch.randn(mel.size(0), 1, audio_length, device=device)
+        inference_steps = max(1, min(int(inference_steps), self.timesteps))
         step_indices = torch.linspace(
             self.timesteps - 1,
             0,
-            steps=int(inference_steps),
+            steps=inference_steps,
             device=device,
         ).long()
 
         for idx, step in enumerate(step_indices):
             t = torch.full((mel.size(0),), int(step.item()), device=device, dtype=torch.long)
-            pred_noise = model(x, mel, t)
-            alpha = self.alphas[t].view(-1, 1, 1)
-            alpha_bar = self.alpha_bars[t].view(-1, 1, 1)
-            beta = self.betas[t].view(-1, 1, 1)
+            pred_x0 = model(x, mel, t).clamp(-1.0, 1.0)
+            if idx == len(step_indices) - 1:
+                x = pred_x0
+                break
 
-            x = (x - beta * pred_noise / torch.sqrt(1.0 - alpha_bar)) / torch.sqrt(alpha)
-            if idx < len(step_indices) - 1:
-                x = x + torch.sqrt(beta) * torch.randn_like(x)
+            next_step = step_indices[idx + 1]
+            alpha_bar_t = self.alpha_bars[t].view(-1, 1, 1)
+            alpha_bar_next = self.alpha_bars[next_step].view(1, 1, 1)
+            pred_noise = (x - torch.sqrt(alpha_bar_t) * pred_x0) / torch.sqrt(1.0 - alpha_bar_t).clamp_min(1e-8)
+            x = torch.sqrt(alpha_bar_next) * pred_x0 + torch.sqrt(1.0 - alpha_bar_next) * pred_noise
 
         model.train()
         return x.clamp(-1.0, 1.0)

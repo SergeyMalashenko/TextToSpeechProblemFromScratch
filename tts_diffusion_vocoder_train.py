@@ -156,8 +156,10 @@ def train_one_step(
     noisy_audio = schedule.add_noise(clean_audio, diffusion_step, noise)
 
     with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
-        pred_noise = model(noisy_audio, mel, diffusion_step)
-        loss = F.mse_loss(pred_noise, noise)
+        pred_audio = model(noisy_audio, mel, diffusion_step)
+        loss_l1 = F.l1_loss(pred_audio, clean_audio)
+        loss_mse = F.mse_loss(pred_audio, clean_audio)
+        loss = loss_l1 + loss_mse
 
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
@@ -165,7 +167,11 @@ def train_one_step(
     nn.utils.clip_grad_norm_(model.parameters(), float(hp_get("diffusion_vocoder_clip_grad_norm", 1.0)))
     scaler.step(optimizer)
     scaler.update()
-    return {"loss": float(loss.item())}
+    return {
+        "loss": float(loss.item()),
+        "l1": float(loss_l1.item()),
+        "mse": float(loss_mse.item()),
+    }
 
 
 @torch.no_grad()
@@ -190,9 +196,15 @@ def validate(
         noisy_audio = schedule.add_noise(clean_audio, diffusion_step, noise)
 
         with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
-            pred_noise = model(noisy_audio, mel, diffusion_step)
-            loss = F.mse_loss(pred_noise, noise)
-        metrics.append({"loss": float(loss.item())})
+            pred_audio = model(noisy_audio, mel, diffusion_step)
+            loss_l1 = F.l1_loss(pred_audio, clean_audio)
+            loss_mse = F.mse_loss(pred_audio, clean_audio)
+            loss = loss_l1 + loss_mse
+        metrics.append({
+            "loss": float(loss.item()),
+            "l1": float(loss_l1.item()),
+            "mse": float(loss_mse.item()),
+        })
 
     model.train()
     return average_metric_dict(metrics) if metrics else {"loss": 0.0}
@@ -318,11 +330,21 @@ def main() -> None:
                 amp_device_type=amp_device_type,
             )
             train_metrics.append(stats)
-            pbar.set_postfix(loss=f"{stats['loss']:.5f}")
+            pbar.set_postfix(
+                loss=f"{stats['loss']:.5f}",
+                l1=f"{stats['l1']:.5f}",
+                mse=f"{stats['mse']:.5f}",
+            )
 
         train_stats = average_metric_dict(train_metrics)
-        print(f"[TRAIN epoch={epoch_index}] loss={train_stats['loss']:.6f}")
-        writer.add_scalar("train/loss", train_stats["loss"], epoch_index)
+        print(
+            f"[TRAIN epoch={epoch_index}] "
+            f"loss={train_stats['loss']:.6f} "
+            f"l1={train_stats['l1']:.6f} "
+            f"mse={train_stats['mse']:.6f}"
+        )
+        for key, value in train_stats.items():
+            writer.add_scalar(f"train/{key}", value, epoch_index)
 
         if epoch_index % validate_every_epoch == 0:
             val_stats = validate(
@@ -332,8 +354,14 @@ def main() -> None:
                 device=device,
                 amp_device_type=amp_device_type,
             )
-            print(f"[VAL epoch={epoch_index}] loss={val_stats['loss']:.6f}")
-            writer.add_scalar("val/loss", val_stats["loss"], epoch_index)
+            print(
+                f"[VAL epoch={epoch_index}] "
+                f"loss={val_stats['loss']:.6f} "
+                f"l1={val_stats['l1']:.6f} "
+                f"mse={val_stats['mse']:.6f}"
+            )
+            for key, value in val_stats.items():
+                writer.add_scalar(f"val/{key}", value, epoch_index)
 
         if epoch_index % sample_every_epoch == 0:
             save_validation_sample(

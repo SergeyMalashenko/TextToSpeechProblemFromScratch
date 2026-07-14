@@ -143,7 +143,7 @@ class DiffusionVocoder(nn.Module):
         diffusion_step: integer tensor (B,)
 
     Returns:
-        predicted noise: (B, 1, T_audio)
+        predicted clean waveform x0: (B, 1, T_audio)
     """
 
     def __init__(self) -> None:
@@ -208,7 +208,7 @@ class DiffusionVocoder(nn.Module):
         assert skip_sum is not None
         x = skip_sum / math.sqrt(len(self.residual_layers))
         x = F.relu(self.skip_projection(x))
-        return self.output_projection(x)
+        return torch.tanh(self.output_projection(x))
 
 
 def get_param_size(model: nn.Module) -> int:
