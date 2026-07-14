@@ -164,16 +164,22 @@ diffusion_vocoder_inference_steps = 50
 diffusion_vocoder_beta_start = 1e-4
 diffusion_vocoder_beta_end = 0.02
 
-diffusion_vocoder_residual_layers = 24
-diffusion_vocoder_residual_channels = 64
+diffusion_vocoder_residual_layers = 30
+diffusion_vocoder_residual_channels = 128
 diffusion_vocoder_dilation_cycle = 10
 diffusion_vocoder_embedding_dim = 128
-diffusion_vocoder_conditioner_channels = 128
+diffusion_vocoder_conditioner_channels = 256
 diffusion_vocoder_upsample_rates = [5, 5, 11]
 diffusion_vocoder_upsample_kernel_sizes = [10, 10, 22]
 diffusion_vocoder_clip_grad_norm = 1.0
 diffusion_vocoder_weight_decay = 1e-6
 diffusion_vocoder_val_batches = 0
+diffusion_vocoder_stft_weight = 1.0
+diffusion_vocoder_stft_resolutions = [
+    (512, 128, 512),
+    (1024, 256, 1024),
+    (2048, hop_length, win_length),
+]
 
 resume_diffusion_vocoder_checkpoint = None
 restore_diffusion_vocoder_epoch = None
