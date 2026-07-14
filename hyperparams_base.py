@@ -118,8 +118,12 @@ hifigan_batch_size = 16
 hifigan_lr = 2e-4
 hifigan_epochs = 10000
 hifigan_segment_size = hop_length * 64
-hifigan_save_step = 5000
-hifigan_val_step = 2000
+hifigan_validate_every_epoch = 1
+hifigan_save_every_epoch = 1
+hifigan_sample_every_epoch = 5
+hifigan_max_checkpoints_to_keep = 0  # 0 keeps all epoch checkpoints
+hifigan_log_dir = "./outputs/logs/hifigan"
+hifigan_sample_path = "./outputs/samples/hifigan"
 
 hifigan_lambda_fm = 2.0
 hifigan_lambda_mel = 45.0
@@ -135,4 +139,4 @@ hifigan_resblock_kernel_sizes = [3, 7, 11]
 hifigan_resblock_dilation_sizes = [(1, 3, 5), (1, 3, 5), (1, 3, 5)]
 
 resume_hifigan_checkpoint = None
-restore_hifigan_step = None
+restore_hifigan_epoch = None

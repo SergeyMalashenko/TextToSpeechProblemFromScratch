@@ -135,7 +135,7 @@ python tts_transformer_synthesis.py \
   --backend hifigan \
   --text "Hello world" \
   --transformer_ckpt ./outputs/checkpoints/transformer/checkpoint_transformer_tacotron2_epoch_0100.pth.tar \
-  --hifigan_ckpt ./outputs/checkpoints/hifigan/checkpoint_hifigan_50000.pth.tar
+  --hifigan_ckpt ./outputs/checkpoints/hifigan/checkpoint_hifigan_epoch_0120.pth.tar
 ```
 
 ### Mamba3 Tacotron-Style Model
@@ -156,7 +156,7 @@ python tts_mamba_synthesis.py \
   --text "B374KH50" \
   --spell_plate \
   --mamba_ckpt ./outputs/checkpoints/mamba/checkpoint_mamba_tacotron2_epoch_0100.pth.tar \
-  --hifigan_ckpt ./outputs/checkpoints/hifigan/checkpoint_hifigan_50000.pth.tar
+  --hifigan_ckpt ./outputs/checkpoints/hifigan/checkpoint_hifigan_epoch_0120.pth.tar
 ```
 
 ## Notes

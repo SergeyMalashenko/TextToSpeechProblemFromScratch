@@ -250,10 +250,10 @@ def resolve_vocoder_checkpoint(arg_value: str | None) -> Path:
 def resolve_hifigan_checkpoint(arg_value: str | None) -> Path:
     if arg_value:
         return Path(arg_value)
-    step = hp_get("restore_hifigan_step", None)
-    if step is None:
+    epoch = hp_get("restore_hifigan_epoch", None)
+    if epoch is None:
         raise ValueError("HiFi-GAN checkpoint is not provided. Use --hifigan_ckpt.")
-    return Path(hp_get("hifigan_checkpoint_path", "./outputs/checkpoints/hifigan")) / f"checkpoint_hifigan_{step}.pth.tar"
+    return Path(hp_get("hifigan_checkpoint_path", "./outputs/checkpoints/hifigan")) / f"checkpoint_hifigan_epoch_{int(epoch):04d}.pth.tar"
 
 
 def load_tacotron(path: str | Path, device: torch.device, strict: bool) -> Tacotron2:
@@ -369,6 +369,7 @@ def synthesize_one(
         hifigan_model.eval()
         wav_t = hifigan_model(mel_after.transpose(1, 2))
         wav = to_numpy(wav_t.squeeze(0).squeeze(0))
+        wav = signal.lfilter([1], [1, -hp.preemphasis], wav)
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
