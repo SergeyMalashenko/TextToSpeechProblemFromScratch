@@ -116,12 +116,12 @@ simple_vocoder_checkpoint_path = "./outputs/checkpoints/vocoder"
 
 hifigan_batch_size = 16
 hifigan_lr = 2e-4
-hifigan_epochs = 10000
+hifigan_epochs = 250
 hifigan_segment_size = hop_length * 64
 hifigan_validate_every_epoch = 1
 hifigan_save_every_epoch = 1
 hifigan_sample_every_epoch = 5
-hifigan_max_checkpoints_to_keep = 0  # 0 keeps all epoch checkpoints
+hifigan_max_checkpoints_to_keep = 10  # 0 keeps all epoch checkpoints
 hifigan_log_dir = "./outputs/logs/hifigan"
 hifigan_sample_path = "./outputs/samples/hifigan"
 
