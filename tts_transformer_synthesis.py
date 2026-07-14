@@ -45,6 +45,14 @@ try:
 except Exception:
     HIFIGAN_CLASS = None
 
+try:
+    from tts_diffusion_schedule import DiffusionSchedule
+    from tts_diffusion_vocoder_model import DiffusionVocoder
+    DIFFUSION_CLASS = DiffusionVocoder
+except Exception:
+    DiffusionSchedule = None
+    DIFFUSION_CLASS = None
+
 
 LETTER_MAP = {
     "A": "alpha", "B": "bravo", "C": "charlie", "E": "echo",
@@ -143,6 +151,12 @@ def resolve_hifigan_checkpoint(arg_value: str | None) -> Path:
     if epoch is None: raise ValueError("HiFi-GAN checkpoint is not provided. Use --hifigan_ckpt.")
     return Path(hp_get("hifigan_checkpoint_path", "./outputs/checkpoints/hifigan")) / f"checkpoint_hifigan_epoch_{int(epoch):04d}.pth.tar"
 
+def resolve_diffusion_checkpoint(arg_value: str | None) -> Path:
+    if arg_value: return Path(arg_value)
+    epoch = hp_get("restore_diffusion_vocoder_epoch", None)
+    if epoch is None: raise ValueError("Diffusion vocoder checkpoint is not provided. Use --diffusion_ckpt.")
+    return Path(hp_get("diffusion_vocoder_checkpoint_path", "./outputs/checkpoints/diffusion_vocoder")) / f"checkpoint_diffusion_vocoder_epoch_{int(epoch):04d}.pth.tar"
+
 def load_transformer_model(transformer_ckpt: str | Path, device: torch.device, strict: bool = True) -> TransformerTacotron2:
     model = TransformerTacotron2().to(device).eval()
     sd = load_checkpoint_state(transformer_ckpt, device=device)
@@ -176,6 +190,13 @@ def load_hifigan_generator(ckpt_path: str | Path, device: torch.device, strict: 
     if hasattr(model, "remove_weight_norm"):
         try: model.remove_weight_norm()
         except Exception: pass
+    return model
+
+def load_diffusion_vocoder(ckpt_path: str | Path, device: torch.device, strict: bool = True):
+    if DIFFUSION_CLASS is None: raise ImportError("DiffusionVocoder implementation was not found.")
+    model = DIFFUSION_CLASS().to(device).eval()
+    sd = load_checkpoint_state(ckpt_path, device=device)
+    model.load_state_dict(sd, strict=strict)
     return model
 
 def invert_spectrogram(spectrogram: np.ndarray) -> np.ndarray:
@@ -219,6 +240,7 @@ def collect_input_texts(args: argparse.Namespace) -> List[str]:
 @torch.no_grad()
 def synthesize_one(source_text: str, transformer_model: TransformerTacotron2, out_dir: str | Path, device: torch.device,
                    backend: str = "griffinlim", mel2mag_model=None, simple_vocoder=None, hifigan_model=None,
+                   diffusion_model=None, diffusion_schedule=None, diffusion_steps: Optional[int] = None,
                    spell_as_plate: bool = False, save_png: bool = False, save_alignment: bool = False,
                    save_mag_png: bool = False, sample_rate: Optional[int] = None, wav_gain: float = 1.0,
                    peak_norm: bool = False, peak_target: float = 0.95) -> Dict[str, str]:
@@ -252,6 +274,17 @@ def synthesize_one(source_text: str, transformer_model: TransformerTacotron2, ou
     elif backend == "hifigan":
         if hifigan_model is None: raise ValueError("hifigan_model is required for hifigan backend")
         wav = to_numpy(hifigan_model(mel_after.transpose(1, 2)).squeeze(0).squeeze(0))
+        wav = signal.lfilter([1], [1, -hp.preemphasis], wav)
+    elif backend == "diffusion":
+        if diffusion_model is None or diffusion_schedule is None:
+            raise ValueError("diffusion_model and diffusion_schedule are required for diffusion backend")
+        wav_t = diffusion_schedule.sample(
+            model=diffusion_model,
+            mel=mel_after,
+            audio_length=int(mel_after.size(1)) * int(hp.hop_length),
+            inference_steps=int(diffusion_steps or hp_get("diffusion_vocoder_inference_steps", 50)),
+        )
+        wav = to_numpy(wav_t.squeeze(0).squeeze(0))
         wav = signal.lfilter([1], [1, -hp.preemphasis], wav)
     else:
         raise ValueError(f"Unknown backend: {backend}")
@@ -299,11 +332,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Speech synthesis using Transformer Tacotron")
     parser.add_argument("--text", type=str, default=None)
     parser.add_argument("--text_file", type=str, default=None)
-    parser.add_argument("--backend", type=str, default="griffinlim", choices=["griffinlim", "simple_vocoder", "hifigan"])
+    parser.add_argument("--backend", type=str, default="griffinlim", choices=["griffinlim", "simple_vocoder", "hifigan", "diffusion"])
     parser.add_argument("--transformer_ckpt", type=str, default=None)
     parser.add_argument("--mel2mag_ckpt", type=str, default=None)
     parser.add_argument("--vocoder_ckpt", type=str, default=None)
     parser.add_argument("--hifigan_ckpt", type=str, default=None)
+    parser.add_argument("--diffusion_ckpt", type=str, default=None)
+    parser.add_argument("--diffusion_steps", type=int, default=int(hp_get("diffusion_vocoder_inference_steps", 50)))
     parser.add_argument("--out_dir", type=str, default=getattr(hp, "synthesis_path", getattr(hp, "sample_path", "./outputs/synthesis/transformer")))
     parser.add_argument("--spell_plate", action="store_true")
     parser.add_argument("--save_png", action="store_true")
@@ -326,7 +361,7 @@ def main() -> None:
 
     transformer_model = load_transformer_model(transformer_ckpt, device, args.strict)
 
-    mel2mag_model = None; simple_vocoder = None; hifigan_model = None
+    mel2mag_model = None; simple_vocoder = None; hifigan_model = None; diffusion_model = None; diffusion_schedule = None
     if args.backend == "griffinlim":
         mel2mag_ckpt = resolve_mel2mag_checkpoint(args.mel2mag_ckpt)
         print(f"Mel2Mag checkpoint    : {mel2mag_ckpt}")
@@ -339,10 +374,18 @@ def main() -> None:
         hifigan_ckpt = resolve_hifigan_checkpoint(args.hifigan_ckpt)
         print(f"HiFi-GAN checkpoint   : {hifigan_ckpt}")
         hifigan_model = load_hifigan_generator(hifigan_ckpt, device, args.strict)
+    elif args.backend == "diffusion":
+        diffusion_ckpt = resolve_diffusion_checkpoint(args.diffusion_ckpt)
+        print(f"Diffusion checkpoint  : {diffusion_ckpt}")
+        print(f"Diffusion steps       : {args.diffusion_steps}")
+        diffusion_model = load_diffusion_vocoder(diffusion_ckpt, device, args.strict)
+        if DiffusionSchedule is None: raise ImportError("DiffusionSchedule implementation was not found.")
+        diffusion_schedule = DiffusionSchedule(int(hp_get("diffusion_vocoder_train_timesteps", 1000)), device)
 
     texts = collect_input_texts(args)
     for text in texts:
         result = synthesize_one(text, transformer_model, args.out_dir, device, args.backend, mel2mag_model, simple_vocoder, hifigan_model,
+                                diffusion_model, diffusion_schedule, args.diffusion_steps,
                                 args.spell_plate, args.save_png, args.save_alignment, args.save_mag_png, args.sr, args.wav_gain,
                                 args.peak_norm, args.peak_target)
         print(json.dumps(result, indent=2, ensure_ascii=False))

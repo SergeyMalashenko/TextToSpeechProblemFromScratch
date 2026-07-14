@@ -12,6 +12,7 @@ training, and standalone synthesis scripts.
 - MelToMag model for Griffin-Lim synthesis
 - Simple neural vocoder
 - HiFi-GAN-style vocoder
+- DiffWave-like diffusion vocoder
 - Shared dataset, text normalization, losses, and seeding utilities
 
 The Mamba path uses Mamba3 blocks from `mamba-ssm`. It is intended for research
@@ -106,6 +107,25 @@ python tts_vocoder_train.py
 python tts_hifigan_train.py
 ```
 
+### Diffusion Vocoder
+
+Experimental DiffWave-like vocoder trained on the same normalized mel features
+and trimmed + preemphasized waveform target used by the HiFi-GAN variant-A path.
+
+```bash
+python tts_diffusion_vocoder_train.py
+tensorboard --logdir ./outputs/logs/diffusion_vocoder
+```
+
+Standalone synthesis from a saved mel artifact:
+
+```bash
+python tts_diffusion_vocoder_synthesis.py \
+  --mel_path ./outputs/samples/hifigan/hifigan_mel_epoch_0245.npy \
+  --checkpoint ./outputs/checkpoints/diffusion_vocoder/checkpoint_diffusion_vocoder_epoch_0100.pth.tar \
+  --out_path ./outputs/synthesis/diffusion_vocoder/sample.wav
+```
+
 ## Synthesis
 
 The project currently has standalone synthesis scripts for RNN, Transformer,
@@ -117,6 +137,7 @@ All synthesis scripts support these waveform backends:
 - `griffinlim` - requires a MelToMag checkpoint
 - `simple_vocoder` - requires a simple vocoder checkpoint
 - `hifigan` - requires a HiFi-GAN generator checkpoint
+- `diffusion` - requires a diffusion vocoder checkpoint
 
 ### RNN Tacotron2
 
@@ -157,6 +178,17 @@ python tts_mamba_synthesis.py \
   --spell_plate \
   --mamba_ckpt ./outputs/checkpoints/mamba/checkpoint_mamba_tacotron2_epoch_0100.pth.tar \
   --hifigan_ckpt ./outputs/checkpoints/hifigan/checkpoint_hifigan_epoch_0120.pth.tar
+```
+
+Diffusion vocoder example:
+
+```bash
+python tts_mamba_synthesis.py \
+  --backend diffusion \
+  --text "Hello world" \
+  --mamba_ckpt ./outputs/checkpoints/mamba/checkpoint_mamba_tacotron2_epoch_0100.pth.tar \
+  --diffusion_ckpt ./outputs/checkpoints/diffusion_vocoder/checkpoint_diffusion_vocoder_epoch_0100.pth.tar \
+  --diffusion_steps 50
 ```
 
 ## Notes
