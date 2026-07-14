@@ -75,6 +75,55 @@ def save_wav(path: str | Path, wav: np.ndarray, sample_rate: int) -> None:
     write(str(path), int(sample_rate), wav)
 
 
+class MultiResolutionSTFTLoss(nn.Module):
+    """
+    Multi-resolution spectral loss for waveform reconstruction.
+
+    Combines spectral convergence and log-magnitude L1 across several STFT
+    resolutions. This gives the diffusion vocoder a direct spectral training
+    signal, which plain waveform L1/MSE lacks.
+    """
+
+    def __init__(self, resolutions: list[tuple[int, int, int]]) -> None:
+        super().__init__()
+        self.resolutions = [(int(n_fft), int(hop), int(win)) for n_fft, hop, win in resolutions]
+        for idx, (_n_fft, _hop, win_length) in enumerate(self.resolutions):
+            self.register_buffer(f"window_{idx}", torch.hann_window(win_length), persistent=False)
+
+    def _magnitude(self, wav: torch.Tensor, idx: int) -> torch.Tensor:
+        n_fft, hop_length, win_length = self.resolutions[idx]
+        window = getattr(self, f"window_{idx}").to(device=wav.device, dtype=wav.dtype)
+        spec = torch.stft(
+            wav,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            window=window,
+            return_complex=True,
+            center=True,
+        )
+        return torch.abs(spec).clamp_min(1e-7)
+
+    def forward(self, pred_audio: torch.Tensor, target_audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        pred = pred_audio.squeeze(1)
+        target = target_audio.squeeze(1)
+        total_sc = pred.new_tensor(0.0)
+        total_log = pred.new_tensor(0.0)
+
+        for idx in range(len(self.resolutions)):
+            pred_mag = self._magnitude(pred, idx)
+            target_mag = self._magnitude(target, idx)
+            sc = torch.linalg.vector_norm(target_mag - pred_mag) / torch.linalg.vector_norm(target_mag).clamp_min(1e-7)
+            log_mag = F.l1_loss(torch.log(pred_mag), torch.log(target_mag))
+            total_sc = total_sc + sc
+            total_log = total_log + log_mag
+
+        denom = float(len(self.resolutions))
+        total_sc = total_sc / denom
+        total_log = total_log / denom
+        return total_sc + total_log, total_sc, total_log
+
+
 def cleanup_old_checkpoints(checkpoint_dir: str | Path, keep_last_n: int) -> None:
     checkpoint_dir = Path(checkpoint_dir)
     if keep_last_n <= 0 or not checkpoint_dir.exists():
@@ -145,6 +194,7 @@ def train_one_step(
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     schedule: DiffusionSchedule,
+    stft_loss_fn: MultiResolutionSTFTLoss,
     batch: dict[str, torch.Tensor],
     device: torch.device,
     amp_device_type: str,
@@ -156,8 +206,15 @@ def train_one_step(
     noisy_audio = schedule.add_noise(clean_audio, diffusion_step, noise)
 
     with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
-        pred_noise = model(noisy_audio, mel, diffusion_step)
-        loss = F.mse_loss(pred_noise, noise)
+        pred_audio = model(noisy_audio, mel, diffusion_step)
+
+    pred_audio_f = pred_audio.float()
+    clean_audio_f = clean_audio.float()
+    loss_l1 = F.l1_loss(pred_audio_f, clean_audio_f)
+    loss_mse = F.mse_loss(pred_audio_f, clean_audio_f)
+    loss_stft, loss_stft_sc, loss_stft_log = stft_loss_fn(pred_audio_f, clean_audio_f)
+    stft_weight = float(hp_get("diffusion_vocoder_stft_weight", 1.0))
+    loss = loss_l1 + loss_mse + stft_weight * loss_stft
 
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
@@ -165,7 +222,14 @@ def train_one_step(
     nn.utils.clip_grad_norm_(model.parameters(), float(hp_get("diffusion_vocoder_clip_grad_norm", 1.0)))
     scaler.step(optimizer)
     scaler.update()
-    return {"loss": float(loss.item())}
+    return {
+        "loss": float(loss.item()),
+        "l1": float(loss_l1.item()),
+        "mse": float(loss_mse.item()),
+        "stft": float(loss_stft.item()),
+        "stft_sc": float(loss_stft_sc.item()),
+        "stft_log": float(loss_stft_log.item()),
+    }
 
 
 @torch.no_grad()
@@ -173,6 +237,7 @@ def validate(
     model: DiffusionVocoder,
     dataloader: DataLoader,
     schedule: DiffusionSchedule,
+    stft_loss_fn: MultiResolutionSTFTLoss,
     device: torch.device,
     amp_device_type: str,
 ) -> dict[str, float]:
@@ -190,9 +255,23 @@ def validate(
         noisy_audio = schedule.add_noise(clean_audio, diffusion_step, noise)
 
         with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
-            pred_noise = model(noisy_audio, mel, diffusion_step)
-            loss = F.mse_loss(pred_noise, noise)
-        metrics.append({"loss": float(loss.item())})
+            pred_audio = model(noisy_audio, mel, diffusion_step)
+
+        pred_audio_f = pred_audio.float()
+        clean_audio_f = clean_audio.float()
+        loss_l1 = F.l1_loss(pred_audio_f, clean_audio_f)
+        loss_mse = F.mse_loss(pred_audio_f, clean_audio_f)
+        loss_stft, loss_stft_sc, loss_stft_log = stft_loss_fn(pred_audio_f, clean_audio_f)
+        stft_weight = float(hp_get("diffusion_vocoder_stft_weight", 1.0))
+        loss = loss_l1 + loss_mse + stft_weight * loss_stft
+        metrics.append({
+            "loss": float(loss.item()),
+            "l1": float(loss_l1.item()),
+            "mse": float(loss_mse.item()),
+            "stft": float(loss_stft.item()),
+            "stft_sc": float(loss_stft_sc.item()),
+            "stft_log": float(loss_stft_log.item()),
+        })
 
     model.train()
     return average_metric_dict(metrics) if metrics else {"loss": 0.0}
@@ -272,6 +351,9 @@ def main() -> None:
         timesteps=int(hp_get("diffusion_vocoder_train_timesteps", 1000)),
         device=device,
     )
+    stft_loss_fn = MultiResolutionSTFTLoss(
+        resolutions=list(hp_get("diffusion_vocoder_stft_resolutions", [(512, 128, 512), (1024, 256, 1024)]))
+    ).to(device)
 
     checkpoint_dir = Path(hp_get("diffusion_vocoder_checkpoint_path", "./outputs/checkpoints/diffusion_vocoder"))
     log_dir = Path(hp_get("diffusion_vocoder_log_dir", "./outputs/logs/diffusion_vocoder"))
@@ -299,6 +381,8 @@ def main() -> None:
     print(f"Segment size       : {segment_size} samples")
     print(f"Train timesteps    : {schedule.timesteps}")
     print(f"Inference steps    : {int(hp_get('diffusion_vocoder_inference_steps', 50))}")
+    print(f"STFT loss weight   : {float(hp_get('diffusion_vocoder_stft_weight', 1.0)):.3f}")
+    print(f"STFT resolutions   : {list(hp_get('diffusion_vocoder_stft_resolutions', []))}")
     print("Target wav         : trimmed + preemphasized waveform")
 
     for epoch in range(start_epoch, int(hp_get("diffusion_vocoder_epochs", 10000))):
@@ -313,27 +397,48 @@ def main() -> None:
                 optimizer=optimizer,
                 scaler=scaler,
                 schedule=schedule,
+                stft_loss_fn=stft_loss_fn,
                 batch=batch,
                 device=device,
                 amp_device_type=amp_device_type,
             )
             train_metrics.append(stats)
-            pbar.set_postfix(loss=f"{stats['loss']:.5f}")
+            pbar.set_postfix(
+                loss=f"{stats['loss']:.5f}",
+                l1=f"{stats['l1']:.5f}",
+                mse=f"{stats['mse']:.5f}",
+                stft=f"{stats['stft']:.5f}",
+            )
 
         train_stats = average_metric_dict(train_metrics)
-        print(f"[TRAIN epoch={epoch_index}] loss={train_stats['loss']:.6f}")
-        writer.add_scalar("train/loss", train_stats["loss"], epoch_index)
+        print(
+            f"[TRAIN epoch={epoch_index}] "
+            f"loss={train_stats['loss']:.6f} "
+            f"l1={train_stats['l1']:.6f} "
+            f"mse={train_stats['mse']:.6f} "
+            f"stft={train_stats['stft']:.6f}"
+        )
+        for key, value in train_stats.items():
+            writer.add_scalar(f"train/{key}", value, epoch_index)
 
         if epoch_index % validate_every_epoch == 0:
             val_stats = validate(
                 model=model,
                 dataloader=val_loader,
                 schedule=schedule,
+                stft_loss_fn=stft_loss_fn,
                 device=device,
                 amp_device_type=amp_device_type,
             )
-            print(f"[VAL epoch={epoch_index}] loss={val_stats['loss']:.6f}")
-            writer.add_scalar("val/loss", val_stats["loss"], epoch_index)
+            print(
+                f"[VAL epoch={epoch_index}] "
+                f"loss={val_stats['loss']:.6f} "
+                f"l1={val_stats['l1']:.6f} "
+                f"mse={val_stats['mse']:.6f} "
+                f"stft={val_stats['stft']:.6f}"
+            )
+            for key, value in val_stats.items():
+                writer.add_scalar(f"val/{key}", value, epoch_index)
 
         if epoch_index % sample_every_epoch == 0:
             save_validation_sample(
