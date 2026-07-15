@@ -65,13 +65,34 @@ class MelUpsampler(nn.Module):
     5 * 5 * 11 = 275.
     """
 
-    def __init__(self, n_mels: int, hidden_channels: int, rates: list[int], kernels: list[int]) -> None:
+    def __init__(
+        self,
+        n_mels: int,
+        hidden_channels: int,
+        rates: list[int],
+        kernels: list[int],
+        conditioner_layers: int,
+    ) -> None:
         super().__init__()
         if len(rates) != len(kernels):
             raise ValueError("rates and kernels must have the same length")
 
+        conditioner_layers = max(1, int(conditioner_layers))
+        conditioner: list[nn.Module] = [
+            nn.Conv1d(n_mels, hidden_channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.4),
+        ]
+        for _ in range(conditioner_layers - 1):
+            conditioner.extend(
+                [
+                    nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+                    nn.LeakyReLU(0.4),
+                ]
+            )
+        self.conditioner = nn.Sequential(*conditioner)
+
         layers: list[nn.Module] = []
-        in_channels = n_mels
+        in_channels = hidden_channels
         for rate, kernel in zip(rates, kernels):
             layers.append(
                 nn.ConvTranspose1d(
@@ -84,10 +105,11 @@ class MelUpsampler(nn.Module):
             )
             layers.append(nn.LeakyReLU(0.4))
             in_channels = hidden_channels
-        self.net = nn.Sequential(*layers)
+        self.upsample = nn.Sequential(*layers)
 
     def forward(self, mel: torch.Tensor, target_length: int | None = None) -> torch.Tensor:
-        x = self.net(mel)
+        x = self.conditioner(mel)
+        x = self.upsample(x)
         if target_length is not None:
             if x.size(-1) > target_length:
                 x = x[..., :target_length]
@@ -154,6 +176,7 @@ class DiffusionVocoder(nn.Module):
         dilation_cycle = int(hp_get("diffusion_vocoder_dilation_cycle", 10))
         diffusion_embedding_dim = int(hp_get("diffusion_vocoder_embedding_dim", 128))
         conditioner_channels = int(hp_get("diffusion_vocoder_conditioner_channels", 128))
+        conditioner_layers = int(hp_get("diffusion_vocoder_conditioner_layers", 1))
         upsample_rates = list(hp_get("diffusion_vocoder_upsample_rates", [5, 5, 11]))
         upsample_kernels = list(hp_get("diffusion_vocoder_upsample_kernel_sizes", [10, 10, 22]))
 
@@ -165,6 +188,7 @@ class DiffusionVocoder(nn.Module):
             hidden_channels=conditioner_channels,
             rates=upsample_rates,
             kernels=upsample_kernels,
+            conditioner_layers=conditioner_layers,
         )
         self.residual_layers = nn.ModuleList(
             [

@@ -169,12 +169,14 @@ diffusion_vocoder_residual_channels = 128
 diffusion_vocoder_dilation_cycle = 10
 diffusion_vocoder_embedding_dim = 128
 diffusion_vocoder_conditioner_channels = 256
+diffusion_vocoder_conditioner_layers = 3
 diffusion_vocoder_upsample_rates = [5, 5, 11]
 diffusion_vocoder_upsample_kernel_sizes = [10, 10, 22]
 diffusion_vocoder_clip_grad_norm = 1.0
 diffusion_vocoder_weight_decay = 1e-6
 diffusion_vocoder_val_batches = 0
 diffusion_vocoder_stft_weight = 1.0
+diffusion_vocoder_mel_loss_weight = 5.0
 diffusion_vocoder_stft_resolutions = [
     (512, 128, 512),
     (1024, 256, 1024),
