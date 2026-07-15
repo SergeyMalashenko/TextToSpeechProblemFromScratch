@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
+import librosa
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -73,6 +74,38 @@ def save_wav(path: str | Path, wav: np.ndarray, sample_rate: int) -> None:
     wav = np.asarray(wav, dtype=np.float32)
     wav = np.clip(wav, -1.0, 1.0)
     write(str(path), int(sample_rate), wav)
+
+
+def build_mel_basis(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    basis = librosa.filters.mel(sr=hp.sr, n_fft=hp.n_fft, n_mels=hp.n_mels)
+    return torch.tensor(basis, device=device, dtype=dtype)
+
+
+def wav_to_log_mel(wav: torch.Tensor, mel_basis: torch.Tensor) -> torch.Tensor:
+    """
+    wav: (B, T)
+    returns: (B, n_mels, T_mel)
+    """
+    window = torch.hann_window(hp.win_length, device=wav.device, dtype=wav.dtype)
+    spec = torch.stft(
+        wav,
+        n_fft=hp.n_fft,
+        hop_length=hp.hop_length,
+        win_length=hp.win_length,
+        window=window,
+        return_complex=True,
+        center=True,
+    )
+    mag = torch.abs(spec).clamp_min(1e-5)
+    mel = torch.matmul(mel_basis.unsqueeze(0), mag)
+    return torch.log(mel.clamp_min(1e-5))
+
+
+def mel_reconstruction_loss(pred_audio: torch.Tensor, target_audio: torch.Tensor, mel_basis: torch.Tensor) -> torch.Tensor:
+    pred_mel = wav_to_log_mel(pred_audio.squeeze(1), mel_basis)
+    target_mel = wav_to_log_mel(target_audio.squeeze(1), mel_basis)
+    min_frames = min(pred_mel.size(-1), target_mel.size(-1))
+    return F.l1_loss(pred_mel[..., :min_frames], target_mel[..., :min_frames])
 
 
 class MultiResolutionSTFTLoss(nn.Module):
@@ -195,6 +228,7 @@ def train_one_step(
     scaler: torch.amp.GradScaler,
     schedule: DiffusionSchedule,
     stft_loss_fn: MultiResolutionSTFTLoss,
+    mel_basis: torch.Tensor,
     batch: dict[str, torch.Tensor],
     device: torch.device,
     amp_device_type: str,
@@ -213,8 +247,10 @@ def train_one_step(
     loss_l1 = F.l1_loss(pred_audio_f, clean_audio_f)
     loss_mse = F.mse_loss(pred_audio_f, clean_audio_f)
     loss_stft, loss_stft_sc, loss_stft_log = stft_loss_fn(pred_audio_f, clean_audio_f)
+    loss_mel = mel_reconstruction_loss(pred_audio_f, clean_audio_f, mel_basis)
     stft_weight = float(hp_get("diffusion_vocoder_stft_weight", 1.0))
-    loss = loss_l1 + loss_mse + stft_weight * loss_stft
+    mel_weight = float(hp_get("diffusion_vocoder_mel_loss_weight", 5.0))
+    loss = loss_l1 + loss_mse + stft_weight * loss_stft + mel_weight * loss_mel
 
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
@@ -229,6 +265,7 @@ def train_one_step(
         "stft": float(loss_stft.item()),
         "stft_sc": float(loss_stft_sc.item()),
         "stft_log": float(loss_stft_log.item()),
+        "mel": float(loss_mel.item()),
     }
 
 
@@ -238,6 +275,7 @@ def validate(
     dataloader: DataLoader,
     schedule: DiffusionSchedule,
     stft_loss_fn: MultiResolutionSTFTLoss,
+    mel_basis: torch.Tensor,
     device: torch.device,
     amp_device_type: str,
 ) -> dict[str, float]:
@@ -262,8 +300,10 @@ def validate(
         loss_l1 = F.l1_loss(pred_audio_f, clean_audio_f)
         loss_mse = F.mse_loss(pred_audio_f, clean_audio_f)
         loss_stft, loss_stft_sc, loss_stft_log = stft_loss_fn(pred_audio_f, clean_audio_f)
+        loss_mel = mel_reconstruction_loss(pred_audio_f, clean_audio_f, mel_basis)
         stft_weight = float(hp_get("diffusion_vocoder_stft_weight", 1.0))
-        loss = loss_l1 + loss_mse + stft_weight * loss_stft
+        mel_weight = float(hp_get("diffusion_vocoder_mel_loss_weight", 5.0))
+        loss = loss_l1 + loss_mse + stft_weight * loss_stft + mel_weight * loss_mel
         metrics.append({
             "loss": float(loss.item()),
             "l1": float(loss_l1.item()),
@@ -271,6 +311,7 @@ def validate(
             "stft": float(loss_stft.item()),
             "stft_sc": float(loss_stft_sc.item()),
             "stft_log": float(loss_stft_log.item()),
+            "mel": float(loss_mel.item()),
         })
 
     model.train()
@@ -354,6 +395,7 @@ def main() -> None:
     stft_loss_fn = MultiResolutionSTFTLoss(
         resolutions=list(hp_get("diffusion_vocoder_stft_resolutions", [(512, 128, 512), (1024, 256, 1024)]))
     ).to(device)
+    mel_basis = build_mel_basis(device=device, dtype=torch.float32)
 
     checkpoint_dir = Path(hp_get("diffusion_vocoder_checkpoint_path", "./outputs/checkpoints/diffusion_vocoder"))
     log_dir = Path(hp_get("diffusion_vocoder_log_dir", "./outputs/logs/diffusion_vocoder"))
@@ -383,6 +425,7 @@ def main() -> None:
     print(f"Inference steps    : {int(hp_get('diffusion_vocoder_inference_steps', 50))}")
     print(f"STFT loss weight   : {float(hp_get('diffusion_vocoder_stft_weight', 1.0)):.3f}")
     print(f"STFT resolutions   : {list(hp_get('diffusion_vocoder_stft_resolutions', []))}")
+    print(f"Mel loss weight    : {float(hp_get('diffusion_vocoder_mel_loss_weight', 5.0)):.3f}")
     print("Target wav         : trimmed + preemphasized waveform")
 
     for epoch in range(start_epoch, int(hp_get("diffusion_vocoder_epochs", 10000))):
@@ -398,6 +441,7 @@ def main() -> None:
                 scaler=scaler,
                 schedule=schedule,
                 stft_loss_fn=stft_loss_fn,
+                mel_basis=mel_basis,
                 batch=batch,
                 device=device,
                 amp_device_type=amp_device_type,
@@ -408,6 +452,7 @@ def main() -> None:
                 l1=f"{stats['l1']:.5f}",
                 mse=f"{stats['mse']:.5f}",
                 stft=f"{stats['stft']:.5f}",
+                mel=f"{stats['mel']:.5f}",
             )
 
         train_stats = average_metric_dict(train_metrics)
@@ -416,7 +461,8 @@ def main() -> None:
             f"loss={train_stats['loss']:.6f} "
             f"l1={train_stats['l1']:.6f} "
             f"mse={train_stats['mse']:.6f} "
-            f"stft={train_stats['stft']:.6f}"
+            f"stft={train_stats['stft']:.6f} "
+            f"mel={train_stats['mel']:.6f}"
         )
         for key, value in train_stats.items():
             writer.add_scalar(f"train/{key}", value, epoch_index)
@@ -427,6 +473,7 @@ def main() -> None:
                 dataloader=val_loader,
                 schedule=schedule,
                 stft_loss_fn=stft_loss_fn,
+                mel_basis=mel_basis,
                 device=device,
                 amp_device_type=amp_device_type,
             )
@@ -435,7 +482,8 @@ def main() -> None:
                 f"loss={val_stats['loss']:.6f} "
                 f"l1={val_stats['l1']:.6f} "
                 f"mse={val_stats['mse']:.6f} "
-                f"stft={val_stats['stft']:.6f}"
+                f"stft={val_stats['stft']:.6f} "
+                f"mel={val_stats['mel']:.6f}"
             )
             for key, value in val_stats.items():
                 writer.add_scalar(f"val/{key}", value, epoch_index)
