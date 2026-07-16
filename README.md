@@ -95,12 +95,6 @@ python tts_mel2mag_train.py
 tensorboard --logdir ./logs/mel2mag
 ```
 
-### Simple Vocoder
-
-```bash
-python tts_vocoder_train.py
-```
-
 ### HiFi-GAN
 
 ```bash
@@ -135,7 +129,6 @@ this repository.
 All synthesis scripts support these waveform backends:
 
 - `griffinlim` - requires a MelToMag checkpoint
-- `simple_vocoder` - requires a simple vocoder checkpoint
 - `hifigan` - requires a HiFi-GAN generator checkpoint
 - `diffusion` - requires a diffusion vocoder checkpoint
 

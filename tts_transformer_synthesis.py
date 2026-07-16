@@ -24,7 +24,6 @@ from text import text_to_sequence
 from tts_transformer_model import TransformerTacotron2
 
 MEL2MAG_CLASS = None
-SIMPLE_VOCODER_CLASS = None
 HIFIGAN_CLASS = None
 
 try:
@@ -32,12 +31,6 @@ try:
     MEL2MAG_CLASS = MelToMagModel
 except Exception:
     MEL2MAG_CLASS = None
-
-try:
-    from tts_vocoder_model import SimpleVocoder
-    SIMPLE_VOCODER_CLASS = SimpleVocoder
-except Exception:
-    SIMPLE_VOCODER_CLASS = None
 
 try:
     from tts_hifigan_model import Generator as HiFiGANGenerator
@@ -139,12 +132,6 @@ def resolve_mel2mag_checkpoint(arg_value: str | None) -> Path:
     if step is None: raise ValueError("Mel2Mag checkpoint is not provided. Use --mel2mag_ckpt.")
     return Path(hp_get("mel2mag_checkpoint_path", "./outputs/checkpoints/mel2mag")) / f"checkpoint_mel2mag_{step}.pth.tar"
 
-def resolve_simple_vocoder_checkpoint(arg_value: str | None) -> Path:
-    if arg_value: return Path(arg_value)
-    step = hp_get("restore_simple_vocoder_step", hp_get("restore_vocoder_step", None))
-    if step is None: raise ValueError("Simple vocoder checkpoint is not provided. Use --vocoder_ckpt.")
-    return Path(hp_get("simple_vocoder_checkpoint_path", "./outputs/checkpoints/vocoder")) / f"checkpoint_vocoder_{step}.pth"
-
 def resolve_hifigan_checkpoint(arg_value: str | None) -> Path:
     if arg_value: return Path(arg_value)
     epoch = hp_get("restore_hifigan_epoch", None)
@@ -167,13 +154,6 @@ def load_mel2mag_model(mel2mag_ckpt: str | Path, device: torch.device, strict: b
     if MEL2MAG_CLASS is None: raise ImportError("MelToMag model implementation was not found.")
     model = MEL2MAG_CLASS().to(device).eval()
     sd = load_checkpoint_state(mel2mag_ckpt, device=device)
-    model.load_state_dict(sd, strict=strict)
-    return model
-
-def load_simple_vocoder(ckpt_path: str | Path, device: torch.device, strict: bool = True):
-    if SIMPLE_VOCODER_CLASS is None: raise ImportError("SimpleVocoder implementation was not found.")
-    model = SIMPLE_VOCODER_CLASS().to(device).eval()
-    sd = load_checkpoint_state(ckpt_path, device=device)
     model.load_state_dict(sd, strict=strict)
     return model
 
@@ -239,7 +219,7 @@ def collect_input_texts(args: argparse.Namespace) -> List[str]:
 
 @torch.no_grad()
 def synthesize_one(source_text: str, transformer_model: TransformerTacotron2, out_dir: str | Path, device: torch.device,
-                   backend: str = "griffinlim", mel2mag_model=None, simple_vocoder=None, hifigan_model=None,
+                   backend: str = "griffinlim", mel2mag_model=None, hifigan_model=None,
                    diffusion_model=None, diffusion_schedule=None, diffusion_steps: Optional[int] = None,
                    spell_as_plate: bool = False, save_png: bool = False, save_alignment: bool = False,
                    save_mag_png: bool = False, sample_rate: Optional[int] = None, wav_gain: float = 1.0,
@@ -268,9 +248,6 @@ def synthesize_one(source_text: str, transformer_model: TransformerTacotron2, ou
         mag_pred = mel2mag_model(mel_after)
         mag_np = to_numpy(mag_pred.squeeze(0))
         wav = spectrogram2wav(mag_np)
-    elif backend == "simple_vocoder":
-        if simple_vocoder is None: raise ValueError("simple_vocoder is required for simple_vocoder backend")
-        wav = to_numpy(simple_vocoder(mel_after).squeeze(0))
     elif backend == "hifigan":
         if hifigan_model is None: raise ValueError("hifigan_model is required for hifigan backend")
         wav = to_numpy(hifigan_model(mel_after.transpose(1, 2)).squeeze(0).squeeze(0))
@@ -332,10 +309,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Speech synthesis using Transformer Tacotron")
     parser.add_argument("--text", type=str, default=None)
     parser.add_argument("--text_file", type=str, default=None)
-    parser.add_argument("--backend", type=str, default="griffinlim", choices=["griffinlim", "simple_vocoder", "hifigan", "diffusion"])
+    parser.add_argument("--backend", type=str, default="griffinlim", choices=["griffinlim", "hifigan", "diffusion"])
     parser.add_argument("--transformer_ckpt", type=str, default=None)
     parser.add_argument("--mel2mag_ckpt", type=str, default=None)
-    parser.add_argument("--vocoder_ckpt", type=str, default=None)
     parser.add_argument("--hifigan_ckpt", type=str, default=None)
     parser.add_argument("--diffusion_ckpt", type=str, default=None)
     parser.add_argument("--diffusion_steps", type=int, default=int(hp_get("diffusion_vocoder_inference_steps", 50)))
@@ -361,15 +337,11 @@ def main() -> None:
 
     transformer_model = load_transformer_model(transformer_ckpt, device, args.strict)
 
-    mel2mag_model = None; simple_vocoder = None; hifigan_model = None; diffusion_model = None; diffusion_schedule = None
+    mel2mag_model = None; hifigan_model = None; diffusion_model = None; diffusion_schedule = None
     if args.backend == "griffinlim":
         mel2mag_ckpt = resolve_mel2mag_checkpoint(args.mel2mag_ckpt)
         print(f"Mel2Mag checkpoint    : {mel2mag_ckpt}")
         mel2mag_model = load_mel2mag_model(mel2mag_ckpt, device, args.strict)
-    elif args.backend == "simple_vocoder":
-        vocoder_ckpt = resolve_simple_vocoder_checkpoint(args.vocoder_ckpt)
-        print(f"Simple vocoder ckpt   : {vocoder_ckpt}")
-        simple_vocoder = load_simple_vocoder(vocoder_ckpt, device, args.strict)
     elif args.backend == "hifigan":
         hifigan_ckpt = resolve_hifigan_checkpoint(args.hifigan_ckpt)
         print(f"HiFi-GAN checkpoint   : {hifigan_ckpt}")
@@ -384,7 +356,7 @@ def main() -> None:
 
     texts = collect_input_texts(args)
     for text in texts:
-        result = synthesize_one(text, transformer_model, args.out_dir, device, args.backend, mel2mag_model, simple_vocoder, hifigan_model,
+        result = synthesize_one(text, transformer_model, args.out_dir, device, args.backend, mel2mag_model, hifigan_model,
                                 diffusion_model, diffusion_schedule, args.diffusion_steps,
                                 args.spell_plate, args.save_png, args.save_alignment, args.save_mag_png, args.sr, args.wav_gain,
                                 args.peak_norm, args.peak_target)
