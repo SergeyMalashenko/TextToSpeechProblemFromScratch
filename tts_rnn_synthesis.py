@@ -16,6 +16,8 @@ from scipy import signal
 from scipy.io.wavfile import write
 
 import hyperparams_rnn as hp
+import hyperparams_hifigan as hp_hifigan
+import hyperparams_diffusion_vocoder as hp_diffusion
 from text import text_to_sequence
 
 from tts_diffusion_schedule import DiffusionSchedule
@@ -93,6 +95,14 @@ DIGIT_MAP = {
 
 def hp_get(name: str, default: Any) -> Any:
     return getattr(hp, name, default)
+
+
+def hifigan_hp_get(name: str, default: Any) -> Any:
+    return getattr(hp, name, getattr(hp_hifigan, name, default))
+
+
+def diffusion_hp_get(name: str, default: Any) -> Any:
+    return getattr(hp, name, getattr(hp_diffusion, name, default))
 
 
 def get_device() -> torch.device:
@@ -242,19 +252,19 @@ def resolve_mel2mag_checkpoint(arg_value: str | None) -> Path:
 def resolve_hifigan_checkpoint(arg_value: str | None) -> Path:
     if arg_value:
         return Path(arg_value)
-    epoch = hp_get("restore_hifigan_epoch", None)
+    epoch = hifigan_hp_get("restore_hifigan_epoch", None)
     if epoch is None:
         raise ValueError("HiFi-GAN checkpoint is not provided. Use --hifigan_ckpt.")
-    return Path(hp_get("hifigan_checkpoint_path", "./outputs/checkpoints/hifigan")) / f"checkpoint_hifigan_epoch_{int(epoch):04d}.pth.tar"
+    return Path(hifigan_hp_get("hifigan_checkpoint_path", "./outputs/checkpoints/hifigan")) / f"checkpoint_hifigan_epoch_{int(epoch):04d}.pth.tar"
 
 
 def resolve_diffusion_checkpoint(arg_value: str | None) -> Path:
     if arg_value:
         return Path(arg_value)
-    epoch = hp_get("restore_diffusion_vocoder_epoch", None)
+    epoch = diffusion_hp_get("restore_diffusion_vocoder_epoch", None)
     if epoch is None:
         raise ValueError("Diffusion vocoder checkpoint is not provided. Use --diffusion_ckpt.")
-    checkpoint_dir = Path(hp_get("diffusion_vocoder_checkpoint_path", "./outputs/checkpoints/diffusion_vocoder"))
+    checkpoint_dir = Path(diffusion_hp_get("diffusion_vocoder_checkpoint_path", "./outputs/checkpoints/diffusion_vocoder"))
     return checkpoint_dir / f"checkpoint_diffusion_vocoder_epoch_{int(epoch):04d}.pth.tar"
 
 
@@ -375,7 +385,7 @@ def synthesize_one(
             model=diffusion_model,
             mel=mel_after,
             audio_length=int(mel_after.size(1)) * int(hp.hop_length),
-            inference_steps=int(diffusion_steps or hp_get("diffusion_vocoder_inference_steps", 50)),
+            inference_steps=int(diffusion_steps or diffusion_hp_get("diffusion_vocoder_inference_steps", 50)),
         )
         wav = to_numpy(wav_t.squeeze(0).squeeze(0))
         wav = signal.lfilter([1], [1, -hp.preemphasis], wav)
@@ -460,7 +470,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mel2mag_ckpt", type=str, default=None, help="Path to MelToMag checkpoint")
     parser.add_argument("--hifigan_ckpt", type=str, default=None, help="Path to HiFi-GAN checkpoint")
     parser.add_argument("--diffusion_ckpt", type=str, default=None, help="Path to diffusion vocoder checkpoint")
-    parser.add_argument("--diffusion_steps", type=int, default=int(hp_get("diffusion_vocoder_inference_steps", 50)), help="Diffusion sampling steps")
+    parser.add_argument("--diffusion_steps", type=int, default=int(diffusion_hp_get("diffusion_vocoder_inference_steps", 50)), help="Diffusion sampling steps")
 
     parser.add_argument("--strict", action="store_true", help="Use strict=True when loading checkpoints")
     parser.add_argument("--out_dir", type=str, default=getattr(hp, "synthesis_path", getattr(hp, "sample_path", "./outputs/synthesis/rnn")), help="Output directory")
@@ -530,7 +540,7 @@ def main() -> None:
         print(f"Diffusion steps     : {args.diffusion_steps}")
         diffusion_model = load_diffusion_vocoder(diffusion_ckpt, device=device, strict=args.strict)
         diffusion_schedule = DiffusionSchedule(
-            timesteps=int(hp_get("diffusion_vocoder_train_timesteps", 1000)),
+            timesteps=int(diffusion_hp_get("diffusion_vocoder_train_timesteps", 1000)),
             device=device,
         )
 

@@ -11,7 +11,7 @@ import torch
 from scipy import signal
 from scipy.io.wavfile import write
 
-import hyperparams_base as hp
+import hyperparams_diffusion_vocoder as hp
 from tts_diffusion_schedule import DiffusionSchedule
 from tts_diffusion_vocoder_model import DiffusionVocoder
 

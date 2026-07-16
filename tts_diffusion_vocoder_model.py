@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import hyperparams_base as hp
+import hyperparams_diffusion_vocoder as hp
 
 
 def hp_get(name: str, default):

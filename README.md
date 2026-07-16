@@ -24,6 +24,8 @@ comparison with the RNN and Transformer acoustic models.
 - `hyperparams_transformer.py` - Transformer Tacotron settings
 - `hyperparams_mamba.py` - Mamba Tacotron-style settings
 - `hyperparams_mel2mag.py` - MelToMag settings
+- `hyperparams_hifigan.py` - HiFi-GAN vocoder settings
+- `hyperparams_diffusion_vocoder.py` - diffusion vocoder settings
 
 ## Data Preparation
 

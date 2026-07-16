@@ -17,7 +17,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-import hyperparams_base as hp
+import hyperparams_diffusion_vocoder as hp
 from tts_dataset import get_hifigan_dataset, collate_fn_hifigan
 from tts_diffusion_schedule import DiffusionSchedule
 from tts_diffusion_vocoder_model import DiffusionVocoder

@@ -15,7 +15,7 @@ from scipy.io.wavfile import write
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-import hyperparams_base as hp
+import hyperparams_hifigan as hp
 from tts_dataset import get_hifigan_dataset, collate_fn_hifigan
 from tts_hifigan_model import (
     Generator,
@@ -236,8 +236,9 @@ def main() -> None:
     set_seed(seed)
     device = get_device()
 
-    train_source_dataset = get_hifigan_dataset(random_segments=True)
-    val_source_dataset = get_hifigan_dataset(random_segments=False)
+    segment_size = int(hp_get("hifigan_segment_size", hp.hop_length * 64))
+    train_source_dataset = get_hifigan_dataset(segment_size=segment_size, random_segments=True)
+    val_source_dataset = get_hifigan_dataset(segment_size=segment_size, random_segments=False)
 
     dataset_size = len(train_source_dataset)
     val_size = max(1, int(dataset_size * get_val_ratio()))
@@ -317,8 +318,8 @@ def main() -> None:
     print(f"Checkpoint dir     : {checkpoint_dir}")
     print(f"Log dir            : {log_dir}")
     print(f"Sample dir         : {sample_dir}")
-    print(f"Segment size       : {int(hp_get('hifigan_segment_size', hp.hop_length * 64))} samples")
-    print(f"Segment frames     : {int(hp_get('hifigan_segment_size', hp.hop_length * 64)) // int(hp.hop_length)}")
+    print(f"Segment size       : {segment_size} samples")
+    print(f"Segment frames     : {segment_size // int(hp.hop_length)}")
     print(f"Validate every     : {validate_every_epoch} epoch(s)")
     print(f"Checkpoint every   : {save_every_epoch} epoch(s)")
     print(f"Sample every       : {sample_every_epoch} epoch(s)")

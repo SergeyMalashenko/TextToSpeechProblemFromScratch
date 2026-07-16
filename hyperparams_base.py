@@ -78,9 +78,6 @@ synthesis_path = "./outputs/synthesis/rnn"
 # Auxiliary acoustic checkpoints
 mel2mag_checkpoint_path = "./outputs/checkpoints/mel2mag"
 
-# Vocoder checkpoints
-hifigan_checkpoint_path = "./outputs/checkpoints/vocoder_hifigan"
-
 # =============================================================================
 # Unified synthesis defaults
 # =============================================================================
@@ -91,80 +88,3 @@ default_vocoder_backend = "griffinlim"
 default_wav_gain = 1.0
 default_peak_norm = False
 default_peak_target = 0.95
-
-
-# =============================================================================
-# HiFi-GAN
-# =============================================================================
-
-hifigan_batch_size = 16
-hifigan_lr = 2e-4
-hifigan_epochs = 250
-hifigan_segment_size = hop_length * 64
-hifigan_validate_every_epoch = 1
-hifigan_save_every_epoch = 1
-hifigan_sample_every_epoch = 5
-hifigan_max_checkpoints_to_keep = 10  # 0 keeps all epoch checkpoints
-hifigan_log_dir = "./outputs/logs/hifigan"
-hifigan_sample_path = "./outputs/samples/hifigan"
-
-hifigan_lambda_fm = 2.0
-hifigan_lambda_mel = 45.0
-hifigan_checkpoint_path = "./outputs/checkpoints/hifigan"
-
-# The product of the upsample rates should match hop_length.
-# For sr = 22050 and frame_shift = 0.0125:
-# hop_length = 275 = 5 * 5 * 11
-hifigan_upsample_rates = [5, 5, 11]
-hifigan_upsample_kernel_sizes = [10, 10, 22]
-hifigan_upsample_initial_channel = 512
-hifigan_resblock_kernel_sizes = [3, 7, 11]
-hifigan_resblock_dilation_sizes = [(1, 3, 5), (1, 3, 5), (1, 3, 5)]
-
-resume_hifigan_checkpoint = None
-restore_hifigan_epoch = None
-
-
-# =============================================================================
-# Diffusion vocoder
-# =============================================================================
-
-diffusion_vocoder_batch_size = 16
-diffusion_vocoder_lr = 2e-4
-diffusion_vocoder_epochs = 10000
-diffusion_vocoder_segment_size = hop_length * 64
-diffusion_vocoder_validate_every_epoch = 1
-diffusion_vocoder_save_every_epoch = 1
-diffusion_vocoder_sample_every_epoch = 5
-diffusion_vocoder_max_checkpoints_to_keep = 0  # 0 keeps all epoch checkpoints
-
-diffusion_vocoder_checkpoint_path = "./outputs/checkpoints/diffusion_vocoder"
-diffusion_vocoder_log_dir = "./outputs/logs/diffusion_vocoder"
-diffusion_vocoder_sample_path = "./outputs/samples/diffusion_vocoder"
-
-diffusion_vocoder_train_timesteps = 1000
-diffusion_vocoder_inference_steps = 50
-diffusion_vocoder_beta_start = 1e-4
-diffusion_vocoder_beta_end = 0.02
-
-diffusion_vocoder_residual_layers = 30
-diffusion_vocoder_residual_channels = 128
-diffusion_vocoder_dilation_cycle = 10
-diffusion_vocoder_embedding_dim = 128
-diffusion_vocoder_conditioner_channels = 256
-diffusion_vocoder_conditioner_layers = 3
-diffusion_vocoder_upsample_rates = [5, 5, 11]
-diffusion_vocoder_upsample_kernel_sizes = [10, 10, 22]
-diffusion_vocoder_clip_grad_norm = 1.0
-diffusion_vocoder_weight_decay = 1e-6
-diffusion_vocoder_val_batches = 0
-diffusion_vocoder_stft_weight = 1.0
-diffusion_vocoder_mel_loss_weight = 5.0
-diffusion_vocoder_stft_resolutions = [
-    (512, 128, 512),
-    (1024, 256, 1024),
-    (2048, hop_length, win_length),
-]
-
-resume_diffusion_vocoder_checkpoint = None
-restore_diffusion_vocoder_epoch = None

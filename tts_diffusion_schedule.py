@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import torch
 
-import hyperparams_base as hp
+import hyperparams_diffusion_vocoder as hp
 from tts_diffusion_vocoder_model import DiffusionVocoder
 
 
