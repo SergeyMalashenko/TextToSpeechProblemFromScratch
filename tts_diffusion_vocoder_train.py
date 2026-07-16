@@ -21,6 +21,7 @@ import hyperparams_base as hp
 from tts_dataset import get_hifigan_dataset, collate_fn_hifigan
 from tts_diffusion_schedule import DiffusionSchedule
 from tts_diffusion_vocoder_model import DiffusionVocoder
+from tts_seed import make_torch_generator, seed_worker, set_seed
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -46,12 +47,6 @@ def get_val_ratio() -> float:
 
 def get_seed() -> int:
     return int(hp_get("seed", 42))
-
-
-def set_seed(seed: int) -> None:
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
 
 
 def average_metric_dict(metrics: list[dict[str, float]]) -> dict[str, float]:
@@ -343,7 +338,8 @@ def save_validation_sample(
 
 
 def main() -> None:
-    set_seed(get_seed())
+    seed = get_seed()
+    set_seed(seed)
     device = get_device()
     amp_device_type = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -354,7 +350,7 @@ def main() -> None:
     dataset_size = len(train_source_dataset)
     val_size = max(1, int(dataset_size * get_val_ratio()))
     train_size = dataset_size - val_size
-    indices = torch.randperm(dataset_size, generator=torch.Generator().manual_seed(get_seed())).tolist()
+    indices = torch.randperm(dataset_size, generator=make_torch_generator(seed)).tolist()
     val_indices = indices[:val_size]
     train_indices = indices[val_size:]
     train_dataset = Subset(train_source_dataset, train_indices)
@@ -369,6 +365,8 @@ def main() -> None:
         drop_last=True,
         num_workers=get_num_workers(),
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker,
+        generator=make_torch_generator(seed),
     )
     val_loader = DataLoader(
         val_dataset,
@@ -378,6 +376,7 @@ def main() -> None:
         drop_last=False,
         num_workers=max(0, get_num_workers() // 2),
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker,
     )
 
     model = DiffusionVocoder().to(device)

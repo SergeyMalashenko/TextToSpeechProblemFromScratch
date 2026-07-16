@@ -191,7 +191,7 @@ python tts_mamba_synthesis.py \
 4. Mamba model/train/synthesis import `hyperparams_mamba.py`.
 5. MelToMag model/train import `hyperparams_mel2mag.py`.
 6. `tts_tacotron_losses.py` provides the shared Tacotron-style mel, gate, and guided-attention losses.
-7. `tts_seed.py` provides reproducibility helpers for training scripts.
+7. `tts_seed.py` provides shared reproducibility helpers used by all training scripts.
 
 ## Current Caveats
 

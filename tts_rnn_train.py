@@ -18,7 +18,7 @@ from tts_dataset import get_tacotron_dataset, collate_fn_tacotron
 from tts_rnn_model import Tacotron2
 from tts_tacotron_losses import Tacotron2Loss, sequence_mask
 
-from tts_seed import set_seed, seed_worker
+from tts_seed import make_torch_generator, seed_worker, set_seed
 
 
 try:
@@ -705,11 +705,8 @@ def main() -> None:
     train_dataset, val_dataset = random_split(
         full_dataset,
         [train_size, val_size],
-        generator=torch.Generator().manual_seed(seed),
+        generator=make_torch_generator(seed),
     )
-
-    train_generator = torch.Generator()
-    train_generator.manual_seed(seed)
 
     train_loader = DataLoader(
         train_dataset,
@@ -720,7 +717,7 @@ def main() -> None:
         num_workers=get_num_workers(),
         pin_memory=torch.cuda.is_available(),
         worker_init_fn=seed_worker,
-        generator=train_generator,
+        generator=make_torch_generator(seed),
     )
 
     val_loader = DataLoader(

@@ -24,6 +24,7 @@ from tts_dataset import (
 
 from tts_mamba_model import MambaTacotron2
 from tts_tacotron_losses import Tacotron2Loss, sequence_mask
+from tts_seed import make_torch_generator, seed_worker, set_seed
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -169,6 +170,7 @@ def build_train_dataloader(train_dataset) -> DataLoader:
             bucket_size=bucket_size,
             shuffle=True,
             drop_last=bucket_drop_last,
+            seed=get_seed(),
         )
         return DataLoader(
             train_dataset,
@@ -176,6 +178,7 @@ def build_train_dataloader(train_dataset) -> DataLoader:
             num_workers=get_num_workers(),
             pin_memory=pin_memory,
             collate_fn=collate_fn_tacotron,
+            worker_init_fn=seed_worker,
         )
 
     print("[DataLoader] Using plain random sampler")
@@ -187,17 +190,14 @@ def build_train_dataloader(train_dataset) -> DataLoader:
         drop_last=True,
         num_workers=get_num_workers(),
         pin_memory=pin_memory,
+        worker_init_fn=seed_worker,
+        generator=make_torch_generator(get_seed()),
     )
 
 
 # =============================================================================
 # Utility functions
 # =============================================================================
-
-def set_seed(seed: int) -> None:
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
 
 def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -745,7 +745,8 @@ def validate(
 # =============================================================================
 
 def main() -> None:
-    set_seed(get_seed())
+    seed = get_seed()
+    set_seed(seed)
 
     device = get_device()
     amp_device_type = get_amp_device_type()
@@ -762,7 +763,7 @@ def main() -> None:
     train_dataset, val_dataset = random_split(
         full_dataset,
         [train_size, val_size],
-        generator=torch.Generator().manual_seed(get_seed()),
+        generator=make_torch_generator(seed),
     )
    
     train_loader = build_train_dataloader(train_dataset)
@@ -775,6 +776,7 @@ def main() -> None:
         drop_last=False,
         num_workers=max(0, get_num_workers() // 2),
         pin_memory=bool(hp_get("pin_memory", torch.cuda.is_available())),
+        worker_init_fn=seed_worker,
     )
     
     model = MambaTacotron2().to(device)

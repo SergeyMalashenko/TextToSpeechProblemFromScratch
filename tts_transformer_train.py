@@ -23,6 +23,7 @@ from tts_dataset import (
 
 from tts_transformer_model import TransformerTacotron2
 from tts_tacotron_losses import Tacotron2Loss, sequence_mask
+from tts_seed import make_torch_generator, seed_worker, set_seed
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -131,11 +132,6 @@ def create_experiment_log_dir(base_dir: str | Path, prefix: str) -> Path:
 
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
-
-
-def set_seed(seed: int) -> None:
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
 def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -550,7 +546,8 @@ def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader,
 
 
 def main() -> None:
-    set_seed(get_seed())
+    seed = get_seed()
+    set_seed(seed)
     device = get_device()
     amp_device_type = get_amp_device_type()
 
@@ -564,7 +561,7 @@ def main() -> None:
     train_dataset, val_dataset = random_split(
         full_dataset,
         [train_size, val_size],
-        generator=torch.Generator().manual_seed(get_seed()),
+        generator=make_torch_generator(seed),
     )
     
     use_bucket_sampler = bool(getattr(hp, "use_bucket_sampler", True))
@@ -579,6 +576,7 @@ def main() -> None:
             bucket_size=hp.batch_size * 20,
             shuffle=True,
             drop_last=False,
+            seed=seed,
         )
         
         train_loader = DataLoader(
@@ -587,6 +585,7 @@ def main() -> None:
             num_workers=hp.num_workers,
             pin_memory=torch.cuda.is_available(),
             collate_fn=collate_fn_tacotron,
+            worker_init_fn=seed_worker,
         )
     else:
         print("[DataLoader] Using plain random sampler")
@@ -598,6 +597,8 @@ def main() -> None:
             drop_last=True,
             num_workers=get_num_workers(),
             pin_memory=bool(hp_get("pin_memory", torch.cuda.is_available())),
+            worker_init_fn=seed_worker,
+            generator=make_torch_generator(seed),
         )
     
     val_loader = DataLoader(
@@ -608,6 +609,7 @@ def main() -> None:
         drop_last=False,
         num_workers=max(0, get_num_workers() // 2),
         pin_memory=bool(hp_get("pin_memory", torch.cuda.is_available())),
+        worker_init_fn=seed_worker,
     )
 
     model = TransformerTacotron2().to(device)

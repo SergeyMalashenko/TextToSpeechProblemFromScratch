@@ -3,13 +3,13 @@
 
 from __future__ import annotations
 
-import numpy as np
-
-import random
-import torch
 import os
-
+import random
 from typing import Optional
+
+import numpy as np
+import torch
+
 
 def set_seed(
     seed: int,
@@ -26,16 +26,18 @@ def set_seed(
         - This function avoids torch.use_deterministic_algorithms(True), because
           it may break training if the model uses a non-deterministic operation.
     """
-    print("Hello world!")
-    random.seed   (seed)
+    if set_python_hash_seed:
+        os.environ["PYTHONHASHSEED"] = str(seed)
+
+    random.seed(seed)
     np.random.seed(seed)
 
-    torch.manual_seed         (seed)
-    torch.cuda.manual_seed    (seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    #torch.backends.cudnn.deterministic = bool(deterministic)
-    #torch.backends.cudnn.benchmark = bool(benchmark)
+    torch.backends.cudnn.deterministic = bool(deterministic)
+    torch.backends.cudnn.benchmark = bool(benchmark)
 
 
 def seed_worker(worker_id: int) -> None:

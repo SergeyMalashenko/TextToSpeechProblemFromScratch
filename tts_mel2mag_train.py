@@ -14,6 +14,7 @@ from tqdm import tqdm
 import hyperparams_mel2mag as hp
 from tts_dataset import get_mel2mag_dataset, collate_fn_mel2mag
 from tts_mel2mag_model import MelToMagModel
+from tts_seed import make_torch_generator, seed_worker, set_seed
 
 
 try:
@@ -52,11 +53,6 @@ def get_checkpoint_every() -> int:
 
 def get_max_checkpoints_to_keep() -> int:
     return int(hp_get("max_checkpoints_to_keep", 5))
-
-
-def set_seed(seed: int) -> None:
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
 def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -220,7 +216,8 @@ def validate(
 
 
 def main() -> None:
-    set_seed(get_seed())
+    seed = get_seed()
+    set_seed(seed)
 
     device = get_device()
     amp_device_type = get_amp_device_type()
@@ -236,7 +233,7 @@ def main() -> None:
     train_dataset, val_dataset = random_split(
         full_dataset,
         [train_size, val_size],
-        generator=torch.Generator().manual_seed(get_seed()),
+        generator=make_torch_generator(seed),
     )
 
     train_loader = DataLoader(
@@ -247,6 +244,8 @@ def main() -> None:
         drop_last=True,
         num_workers=get_num_workers(),
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker,
+        generator=make_torch_generator(seed),
     )
 
     val_loader = DataLoader(
@@ -257,6 +256,7 @@ def main() -> None:
         drop_last=False,
         num_workers=max(0, get_num_workers() // 2),
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker,
     )
 
     model = MelToMagModel().to(device)
