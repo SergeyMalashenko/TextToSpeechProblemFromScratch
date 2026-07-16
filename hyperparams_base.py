@@ -79,7 +79,6 @@ synthesis_path = "./outputs/synthesis/rnn"
 mel2mag_checkpoint_path = "./outputs/checkpoints/mel2mag"
 
 # Vocoder checkpoints
-simple_vocoder_checkpoint_path = "./outputs/checkpoints/vocoder_simple"
 hifigan_checkpoint_path = "./outputs/checkpoints/vocoder_hifigan"
 
 # =============================================================================
@@ -92,22 +91,6 @@ default_vocoder_backend = "griffinlim"
 default_wav_gain = 1.0
 default_peak_norm = False
 default_peak_target = 0.95
-
-
-# =============================================================================
-# Simple neural vocoder
-# =============================================================================
-
-vocoder_batch_size = 16
-vocoder_lr = 2e-4
-vocoder_epochs = 10000
-vocoder_segment_size = hop_length * 64
-vocoder_save_step = 5000
-
-resume_vocoder_checkpoint = None
-restore_simple_vocoder_step = None
-restore_vocoder_step = None
-simple_vocoder_checkpoint_path = "./outputs/checkpoints/vocoder"
 
 
 # =============================================================================

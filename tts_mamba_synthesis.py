@@ -23,7 +23,6 @@ from tts_diffusion_vocoder_model import DiffusionVocoder
 from tts_hifigan_model import Generator as HiFiGANGenerator
 from tts_mel2mag_model import MelToMagModel
 from tts_mamba_model import MambaTacotron2
-from tts_vocoder_model import SimpleVocoder
 
 
 def spectrogram2wav(mag: np.ndarray) -> np.ndarray:
@@ -241,15 +240,6 @@ def resolve_mel2mag_checkpoint(arg_value: str | None) -> Path:
     return checkpoint_dir / f"checkpoint_mel2mag_{step}.pth.tar"
 
 
-def resolve_vocoder_checkpoint(arg_value: str | None) -> Path:
-    if arg_value:
-        return Path(arg_value)
-    step = hp_get("restore_simple_vocoder_step", hp_get("restore_vocoder_step", None))
-    if step is None:
-        raise ValueError("Simple vocoder checkpoint is not provided. Use --vocoder_ckpt.")
-    return Path(hp_get("simple_vocoder_checkpoint_path", "./outputs/checkpoints/vocoder")) / f"checkpoint_vocoder_{step}.pth.tar"
-
-
 def resolve_hifigan_checkpoint(arg_value: str | None) -> Path:
     if arg_value:
         return Path(arg_value)
@@ -277,12 +267,6 @@ def load_mamba(path: str | Path, device: torch.device, strict: bool) -> MambaTac
 
 def load_mel2mag(path: str | Path, device: torch.device, strict: bool) -> MelToMagModel:
     model = MelToMagModel().to(device).eval()
-    model.load_state_dict(load_checkpoint_state(path, device=device), strict=strict)
-    return model
-
-
-def load_simple_vocoder(path: str | Path, device: torch.device, strict: bool) -> SimpleVocoder:
-    model = SimpleVocoder().to(device).eval()
     model.load_state_dict(load_checkpoint_state(path, device=device), strict=strict)
     return model
 
@@ -328,7 +312,6 @@ def synthesize_one(
     device: torch.device,
     backend: str = "griffinlim",
     mel2mag_model: MelToMagModel | None = None,
-    vocoder_model: SimpleVocoder | None = None,
     hifigan_model: HiFiGANGenerator | None = None,
     diffusion_model: DiffusionVocoder | None = None,
     diffusion_schedule: DiffusionSchedule | None = None,
@@ -377,13 +360,6 @@ def synthesize_one(
         mag_pred = mel2mag_model(mel_after)
         mag_np = to_numpy(mag_pred.squeeze(0))
         wav = spectrogram2wav(mag_np)
-
-    elif backend == "simple_vocoder":
-        if vocoder_model is None:
-            raise ValueError("vocoder_model is required for simple_vocoder backend")
-        vocoder_model.eval()
-        wav_t = vocoder_model(mel_after)
-        wav = to_numpy(wav_t.squeeze(0).squeeze(0))
 
     elif backend == "hifigan":
         if hifigan_model is None:
@@ -480,10 +456,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text_file", type=str, default=None, help="Path to text file with one utterance per line")
     parser.add_argument("--spell_plate", action="store_true", help="Convert input like plate symbols to spoken NATO-style words")
 
-    parser.add_argument("--backend", type=str, default="griffinlim", choices=["griffinlim", "simple_vocoder", "hifigan", "diffusion"], help="Waveform backend")
+    parser.add_argument("--backend", type=str, default="griffinlim", choices=["griffinlim", "hifigan", "diffusion"], help="Waveform backend")
     parser.add_argument("--mamba_ckpt", type=str, default=None, help="Path to MambaTacotron2 checkpoint")
     parser.add_argument("--mel2mag_ckpt", type=str, default=None, help="Path to MelToMag checkpoint")
-    parser.add_argument("--vocoder_ckpt", type=str, default=None, help="Path to simple neural vocoder checkpoint")
     parser.add_argument("--hifigan_ckpt", type=str, default=None, help="Path to HiFi-GAN checkpoint")
     parser.add_argument("--diffusion_ckpt", type=str, default=None, help="Path to diffusion vocoder checkpoint")
     parser.add_argument("--diffusion_steps", type=int, default=int(hp_get("diffusion_vocoder_inference_steps", 50)), help="Diffusion sampling steps")
@@ -536,7 +511,6 @@ def main() -> None:
     mamba = load_mamba(mamba_ckpt, device=device, strict=args.strict)
 
     mel2mag_model = None
-    vocoder_model = None
     hifigan_model = None
     diffusion_model = None
     diffusion_schedule = None
@@ -545,11 +519,6 @@ def main() -> None:
         mel2mag_ckpt = resolve_mel2mag_checkpoint(args.mel2mag_ckpt)
         print(f"MelToMag checkpoint: {mel2mag_ckpt}")
         mel2mag_model = load_mel2mag(mel2mag_ckpt, device=device, strict=args.strict)
-
-    elif args.backend == "simple_vocoder":
-        vocoder_ckpt = resolve_vocoder_checkpoint(args.vocoder_ckpt)
-        print(f"Simple vocoder ckpt: {vocoder_ckpt}")
-        vocoder_model = load_simple_vocoder(vocoder_ckpt, device=device, strict=args.strict)
 
     elif args.backend == "hifigan":
         hifigan_ckpt = resolve_hifigan_checkpoint(args.hifigan_ckpt)
@@ -576,7 +545,6 @@ def main() -> None:
             device=device,
             backend=args.backend,
             mel2mag_model=mel2mag_model,
-            vocoder_model=vocoder_model,
             hifigan_model=hifigan_model,
             diffusion_model=diffusion_model,
             diffusion_schedule=diffusion_schedule,
