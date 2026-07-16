@@ -10,7 +10,6 @@ training, and standalone synthesis scripts.
 - Transformer Tacotron acoustic model
 - Mamba3 Tacotron-style acoustic model
 - MelToMag model for Griffin-Lim synthesis
-- Simple neural vocoder
 - HiFi-GAN-style vocoder
 - DiffWave-like diffusion vocoder
 - Shared dataset, text normalization, losses, and seeding utilities
