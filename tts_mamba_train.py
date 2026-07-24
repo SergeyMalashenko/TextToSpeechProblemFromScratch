@@ -646,30 +646,37 @@ def compute_autoregressive_metrics(
     device: torch.device,
 ) -> Dict[str, float]:
     model_w = unwrap_model(model)
+    was_training = model_w.training
+    model_w.eval()
+
     text = batch["text"][:1].to(device)
     text_lengths = batch["text_lengths"][:1].to(device)
     target_frames = int(batch["output_lengths"][0].item())
 
-    outputs = model_w.inference(text=text, text_lengths=text_lengths)
-    alignments = outputs["alignments"][0]
-    gate = outputs["gate"][0]
-    generated_frames = int(alignments.size(0))
-    text_length = int(text_lengths[0].item())
+    try:
+        outputs = model_w.inference(text=text, text_lengths=text_lengths)
+        alignments = outputs["alignments"][0]
+        gate = outputs["gate"][0]
+        generated_frames = int(alignments.size(0))
+        text_length = int(text_lengths[0].item())
 
-    valid_alignments = alignments[:, :text_length]
-    positions = valid_alignments.argmax(dim=-1)
-    backward_jumps = (positions[1:] < positions[:-1]).float().mean() if positions.numel() > 1 else positions.new_tensor(0.0)
-    final_position = int(positions[-1].item()) if positions.numel() > 0 else 0
-    coverage = (final_position + 1) / max(1, text_length)
+        valid_alignments = alignments[:, :text_length]
+        positions = valid_alignments.argmax(dim=-1)
+        backward_jumps = (positions[1:] < positions[:-1]).float().mean() if positions.numel() > 1 else positions.new_tensor(0.0)
+        final_position = int(positions[-1].item()) if positions.numel() > 0 else 0
+        coverage = (final_position + 1) / max(1, text_length)
 
-    return {
-        "ar_generated_frames": float(generated_frames),
-        "ar_target_frames": float(target_frames),
-        "ar_length_ratio": float(generated_frames / max(1, target_frames)),
-        "ar_gate_last_prob": float(torch.sigmoid(gate[-1]).item()) if gate.numel() > 0 else 0.0,
-        "ar_text_coverage": float(coverage),
-        "ar_backward_jump_rate": float(backward_jumps.item()),
-    }
+        return {
+            "ar_generated_frames": float(generated_frames),
+            "ar_target_frames": float(target_frames),
+            "ar_length_ratio": float(generated_frames / max(1, target_frames)),
+            "ar_gate_last_prob": float(torch.sigmoid(gate[-1]).item()) if gate.numel() > 0 else 0.0,
+            "ar_text_coverage": float(coverage),
+            "ar_backward_jump_rate": float(backward_jumps.item()),
+        }
+    finally:
+        if was_training:
+            model_w.train()
 
 
 @torch.no_grad()
