@@ -217,11 +217,11 @@ class TransformerEncoder(nn.Module):
 
 class RecurrentTransformerDecoderBlock(nn.Module):
     """
-    Shared decoder block for recurrent-depth, step-by-step Transformer decoding.
+    Shared decoder block for recurrent-depth Transformer decoding.
 
-    The block is applied multiple times with the same weights for the current
-    mel step. Self-attention uses already generated decoder states as memory,
-    so inference does not need full prefix recomputation.
+    During training it is applied to the full teacher-forced mel prefix with a
+    causal mask. During inference the same block is called step-by-step with the
+    generated decoder-state history as self-attention memory.
     """
 
     def __init__(self) -> None:
@@ -256,11 +256,20 @@ class RecurrentTransformerDecoderBlock(nn.Module):
         self_memory: torch.Tensor,
         encoder_memory: torch.Tensor,
         memory_key_padding_mask: Optional[torch.Tensor],
+        self_attn_mask: Optional[torch.Tensor] = None,
+        self_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = x
         q = self.norm1(x)
         kv = self.norm1(self_memory)
-        y, _ = self.self_attn(q, kv, kv, need_weights=False)
+        y, _ = self.self_attn(
+            q,
+            kv,
+            kv,
+            attn_mask=self_attn_mask,
+            key_padding_mask=self_key_padding_mask,
+            need_weights=False,
+        )
         x = residual + self.dropout(y)
 
         residual = x
@@ -320,6 +329,9 @@ class TransformerDecoder(nn.Module):
         x = x + self.positional_encoding.pe[:, step : step + 1].to(dtype=x.dtype)
         return self.positional_encoding.dropout(x)
 
+    def make_causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
+        return torch.triu(torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1)
+
     def decode_step(
         self,
         decoder_input: torch.Tensor,
@@ -353,34 +365,34 @@ class TransformerDecoder(nn.Module):
         decoder_inputs = self.parse_decoder_inputs(decoder_inputs)
         memory_key_padding_mask = get_mask_from_lengths(text_lengths, max_len=memory.size(1))
 
-        mel_outputs = []
-        gate_outputs = []
-        alignments = []
-        history: list[torch.Tensor] = []
+        x = self.prenet(decoder_inputs)
+        x = self.prenet_proj(x)
+        x = self.positional_encoding(x)
 
-        max_steps = decoder_inputs.size(1)
-        for t in range(max_steps):
-            mel_output, gate_output, alignment, state = self.decode_step(
-                decoder_input=decoder_inputs[:, t, :],
-                memory=memory,
+        causal_mask = self.make_causal_mask(length=x.size(1), device=x.device)
+        decoder_key_padding_mask = None
+        if output_lengths is not None:
+            decoder_key_padding_mask = get_mask_from_lengths(output_lengths, max_len=x.size(1))
+
+        cross_attn_last = None
+        for _ in range(self.recurrent_depth):
+            x, cross_attn_last = self.shared_block(
+                x=x,
+                self_memory=x,
+                encoder_memory=memory,
                 memory_key_padding_mask=memory_key_padding_mask,
-                history=history,
-                step=t,
+                self_attn_mask=causal_mask,
+                self_key_padding_mask=decoder_key_padding_mask,
             )
-            mel_outputs.append(mel_output)
-            gate_outputs.append(gate_output)
-            alignments.append(alignment)
 
-            valid_state = state
-            if output_lengths is not None:
-                valid = (t < output_lengths).to(state.dtype).view(-1, 1, 1)
-                valid_state = state * valid
-            history.append(valid_state)
+        mel_outputs = self.mel_projection(x)
+        gate_outputs = self.gate_projection(x).squeeze(-1)
+        alignments = cross_attn_last.mean(dim=1)
 
         return (
-            torch.stack(mel_outputs, dim=1),
-            torch.stack(gate_outputs, dim=1),
-            torch.stack(alignments, dim=1),
+            mel_outputs,
+            gate_outputs,
+            alignments,
         )
 
     def forward(self, memory: torch.Tensor, mel_input: torch.Tensor, text_lengths: torch.Tensor,
