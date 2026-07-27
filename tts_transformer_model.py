@@ -54,6 +54,10 @@ def get_mask_from_lengths(lengths: torch.Tensor, max_len: Optional[int] = None) 
     return ids.unsqueeze(0) >= lengths.unsqueeze(1)
 
 
+def generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Tensor:
+    return torch.triu(torch.ones(sz, sz, device=device, dtype=torch.bool), diagonal=1)
+
+
 N_MELS = get_n_mels()
 N_SYMBOLS = get_n_symbols()
 R = get_outputs_per_step()
@@ -64,7 +68,6 @@ TRANSFORMER_D_MODEL = hp_get("transformer_d_model", 256)
 TRANSFORMER_NHEAD = hp_get("transformer_nhead", 4)
 TRANSFORMER_ENCODER_LAYERS = hp_get("transformer_encoder_layers", 4)
 TRANSFORMER_DECODER_LAYERS = hp_get("transformer_decoder_layers", 4)
-RECURRENT_TRANSFORMER_DEPTH = hp_get("recurrent_transformer_depth", TRANSFORMER_DECODER_LAYERS)
 TRANSFORMER_FFN_DIM = hp_get("transformer_ffn_dim", 1024)
 TRANSFORMER_DROPOUT = hp_get("transformer_dropout", 0.1)
 
@@ -215,15 +218,7 @@ class TransformerEncoder(nn.Module):
         return self.encoder(x)
 
 
-class RecurrentTransformerDecoderBlock(nn.Module):
-    """
-    Shared decoder block for recurrent-depth Transformer decoding.
-
-    During training it is applied to the full teacher-forced mel prefix with a
-    causal mask. During inference the same block is called step-by-step with the
-    generated decoder-state history as self-attention memory.
-    """
-
+class TransformerDecoderLayerWithAttention(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
@@ -252,44 +247,38 @@ class RecurrentTransformerDecoderBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        self_memory: torch.Tensor,
-        encoder_memory: torch.Tensor,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor],
+        tgt_key_padding_mask: Optional[torch.Tensor],
         memory_key_padding_mask: Optional[torch.Tensor],
-        self_attn_mask: Optional[torch.Tensor] = None,
-        self_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        residual = x
-        q = self.norm1(x)
-        kv = self.norm1(self_memory)
-        y, _ = self.self_attn(
-            q,
-            kv,
-            kv,
-            attn_mask=self_attn_mask,
-            key_padding_mask=self_key_padding_mask,
+        residual = tgt
+        x = self.norm1(tgt)
+        x, _ = self.self_attn(
+            x, x, x,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
             need_weights=False,
         )
-        x = residual + self.dropout(y)
+        tgt = residual + self.dropout(x)
 
-        residual = x
-        q = self.norm2(x)
-        y, cross_attn_weights = self.cross_attn(
-            q,
-            encoder_memory,
-            encoder_memory,
+        residual = tgt
+        x = self.norm2(tgt)
+        x, cross_attn_weights = self.cross_attn(
+            x, memory, memory,
             key_padding_mask=memory_key_padding_mask,
             need_weights=True,
             average_attn_weights=False,
         )
-        x = residual + self.dropout(y)
+        tgt = residual + self.dropout(x)
 
-        residual = x
-        y = self.norm3(x)
-        y = self.linear2(self.dropout_ff(F.relu(self.linear1(y))))
-        x = residual + self.dropout(y)
+        residual = tgt
+        x = self.norm3(tgt)
+        x = self.linear2(self.dropout_ff(F.relu(self.linear1(x))))
+        tgt = residual + self.dropout(x)
 
-        return x, cross_attn_weights
+        return tgt, cross_attn_weights
 
 
 class TransformerDecoder(nn.Module):
@@ -307,11 +296,7 @@ class TransformerDecoder(nn.Module):
             dropout=TRANSFORMER_DROPOUT,
         )
 
-        self.recurrent_depth = int(RECURRENT_TRANSFORMER_DEPTH)
-        if self.recurrent_depth <= 0:
-            raise ValueError(f"recurrent_transformer_depth must be positive, got {self.recurrent_depth}")
-
-        self.shared_block = RecurrentTransformerDecoderBlock()
+        self.layers = nn.ModuleList([TransformerDecoderLayerWithAttention() for _ in range(TRANSFORMER_DECODER_LAYERS)])
 
         self.mel_projection = nn.Linear(TRANSFORMER_D_MODEL, N_MELS)
         self.gate_projection = nn.Linear(TRANSFORMER_D_MODEL, 1)
@@ -321,68 +306,29 @@ class TransformerDecoder(nn.Module):
             raise ValueError(f"Expected mel dim {N_MELS}, got {decoder_inputs.size(-1)}")
         return decoder_inputs
 
-    def add_step_positional_encoding(self, x: torch.Tensor, step: int) -> torch.Tensor:
-        if step >= self.positional_encoding.pe.size(1):
-            raise ValueError(
-                f"Decoder step {step} exceeds positional encoding limit {self.positional_encoding.pe.size(1)}"
-            )
-        x = x + self.positional_encoding.pe[:, step : step + 1].to(dtype=x.dtype)
-        return self.positional_encoding.dropout(x)
-
-    def make_causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
-        return torch.triu(torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1)
-
-    def decode_step(
-        self,
-        decoder_input: torch.Tensor,
-        memory: torch.Tensor,
-        memory_key_padding_mask: torch.Tensor,
-        history: list[torch.Tensor],
-        step: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        x = self.prenet(decoder_input)
-        x = self.prenet_proj(x).unsqueeze(1)
-        x = self.add_step_positional_encoding(x, step)
-
-        cross_attn_last = None
-        for _ in range(self.recurrent_depth):
-            self_memory = x if not history else torch.cat([*history, x], dim=1)
-            x, cross_attn_last = self.shared_block(
-                x=x,
-                self_memory=self_memory,
-                encoder_memory=memory,
-                memory_key_padding_mask=memory_key_padding_mask,
-            )
-
-        mel_output = self.mel_projection(x).squeeze(1)
-        gate_output = self.gate_projection(x).squeeze(1).squeeze(-1)
-        alignment = cross_attn_last.mean(dim=1).squeeze(1)
-
-        return mel_output, gate_output, alignment, x
-
     def decode(self, decoder_inputs: torch.Tensor, memory: torch.Tensor, text_lengths: torch.Tensor,
                output_lengths: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        decoder_inputs = self.parse_decoder_inputs(decoder_inputs)
-        memory_key_padding_mask = get_mask_from_lengths(text_lengths, max_len=memory.size(1))
-
-        x = self.prenet(decoder_inputs)
+        x = self.parse_decoder_inputs(decoder_inputs)
+        x = self.prenet(x)
         x = self.prenet_proj(x)
         x = self.positional_encoding(x)
 
-        causal_mask = self.make_causal_mask(length=x.size(1), device=x.device)
-        decoder_key_padding_mask = None
+        tgt_mask = generate_square_subsequent_mask(x.size(1), device=x.device)
+
+        tgt_key_padding_mask = None
         if output_lengths is not None:
-            decoder_key_padding_mask = get_mask_from_lengths(output_lengths, max_len=x.size(1))
+            tgt_key_padding_mask = get_mask_from_lengths(output_lengths, max_len=x.size(1))
+
+        memory_key_padding_mask = get_mask_from_lengths(text_lengths, max_len=memory.size(1))
 
         cross_attn_last = None
-        for _ in range(self.recurrent_depth):
-            x, cross_attn_last = self.shared_block(
-                x=x,
-                self_memory=x,
-                encoder_memory=memory,
+        for layer in self.layers:
+            x, cross_attn_last = layer(
+                tgt=x,
+                memory=memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
-                self_attn_mask=causal_mask,
-                self_key_padding_mask=decoder_key_padding_mask,
             )
 
         mel_outputs = self.mel_projection(x)
@@ -403,29 +349,29 @@ class TransformerDecoder(nn.Module):
     def inference(self, memory: torch.Tensor, text_lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz = memory.size(0)
         device = memory.device
-        decoder_input = memory.new_zeros(bsz, N_MELS)
-        memory_key_padding_mask = get_mask_from_lengths(text_lengths, max_len=memory.size(1))
+        decoder_inputs = memory.new_zeros(bsz, 1, N_MELS)
 
         generated, gates, alignment_history = [], [], []
-        history: list[torch.Tensor] = []
         finished = torch.zeros(bsz, dtype=torch.bool, device=device)
 
-        for step in range(MAX_DECODER_STEPS):
-            mel_last, gate_last, align_last, state = self.decode_step(
-                decoder_input=decoder_input,
+        for _ in range(MAX_DECODER_STEPS):
+            mel_seq, gate_seq, align_seq = self.decode(
+                decoder_inputs=decoder_inputs,
                 memory=memory,
-                memory_key_padding_mask=memory_key_padding_mask,
-                history=history,
-                step=step,
+                text_lengths=text_lengths,
+                output_lengths=None,
             )
 
-            generated.append(mel_last.unsqueeze(1))
+            mel_last = mel_seq[:, -1:, :]
+            gate_last = gate_seq[:, -1]
+            align_last = align_seq[:, -1:, :]
+
+            generated.append(mel_last)
             gates.append(gate_last.unsqueeze(1))
-            alignment_history.append(align_last.unsqueeze(1))
-            history.append(state)
+            alignment_history.append(align_last)
 
             finished = finished | (torch.sigmoid(gate_last) > GATE_THRESHOLD)
-            decoder_input = mel_last
+            decoder_inputs = torch.cat([decoder_inputs, mel_last], dim=1)
 
             if bool(finished.all()):
                 break

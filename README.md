@@ -15,7 +15,7 @@ attention alignments, and can be used with the same synthesis backends.
 | Model | Main idea | Entry points | Configuration |
 | --- | --- | --- | --- |
 | RNN Tacotron2 | Classic autoregressive Tacotron2 with recurrent decoder and location-sensitive attention. | `tts_rnn_train.py`, `tts_rnn_synthesis.py` | `hyperparams_rnn.py` |
-| Transformer Tacotron | Tacotron-style encoder/decoder built around Transformer attention. The current decoder uses a shared recurrent-depth Transformer block. | `tts_transformer_train.py`, `tts_transformer_synthesis.py` | `hyperparams_transformer.py` |
+| Transformer Tacotron | Tacotron-style encoder/decoder built around Transformer attention with separate decoder layers. | `tts_transformer_train.py`, `tts_transformer_synthesis.py` | `hyperparams_transformer.py` |
 | Mamba3 Tacotron-style model | Mamba3-based acoustic model for comparison with the RNN and Transformer paths. | `tts_mamba_train.py`, `tts_mamba_synthesis.py` | `hyperparams_mamba.py` |
 
 ### Vocoders and waveform reconstruction

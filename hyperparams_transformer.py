@@ -45,10 +45,6 @@ transformer_decoder_layers = 4
 transformer_ffn_dim = 1024
 transformer_dropout = 0.1
 
-# Recurrent Transformer decoder experiment:
-# one shared decoder block is applied this many times at every mel step.
-recurrent_transformer_depth = 5
-
 max_text_positions = 2048
 
 
