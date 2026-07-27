@@ -6,16 +6,36 @@ training, and standalone synthesis scripts.
 
 ## Contents
 
-- RNN Tacotron2 acoustic model
-- Transformer Tacotron acoustic model
-- Mamba3 Tacotron-style acoustic model
-- MelToMag model for Griffin-Lim synthesis
-- HiFi-GAN-style vocoder
-- DiffWave-like diffusion vocoder
-- Shared dataset, text normalization, losses, and seeding utilities
+### Acoustic models
 
-The Mamba path uses Mamba3 blocks from `mamba-ssm`. It is intended for research
-comparison with the RNN and Transformer acoustic models.
+The repository contains three Tacotron-style acoustic models. Each model maps
+normalized text tokens to mel spectrograms, predicts a stop/gate signal, exposes
+attention alignments, and can be used with the same synthesis backends.
+
+| Model | Main idea | Entry points | Configuration |
+| --- | --- | --- | --- |
+| RNN Tacotron2 | Classic autoregressive Tacotron2 with recurrent decoder and location-sensitive attention. | `tts_rnn_train.py`, `tts_rnn_synthesis.py` | `hyperparams_rnn.py` |
+| Transformer Tacotron | Tacotron-style encoder/decoder built around Transformer attention. The current decoder uses a shared recurrent-depth Transformer block. | `tts_transformer_train.py`, `tts_transformer_synthesis.py` | `hyperparams_transformer.py` |
+| Mamba3 Tacotron-style model | Mamba3-based acoustic model for comparison with the RNN and Transformer paths. | `tts_mamba_train.py`, `tts_mamba_synthesis.py` | `hyperparams_mamba.py` |
+
+### Vocoders and waveform reconstruction
+
+The repository provides three waveform reconstruction paths. They all consume
+mel spectrograms, but differ in target representation, quality, speed, and
+training complexity.
+
+| Vocoder path | Main idea | Entry points | Configuration |
+| --- | --- | --- | --- |
+| MelToMag + Griffin-Lim | Predicts magnitude spectrograms from mel spectrograms and reconstructs waveform with Griffin-Lim. | `tts_mel2mag_train.py`; acoustic synthesis scripts with `--backend griffinlim` | `hyperparams_mel2mag.py` |
+| HiFi-GAN | Neural GAN vocoder that maps mel spectrograms directly to waveform samples. | `tts_hifigan_train.py`; acoustic synthesis scripts with `--backend hifigan` | `hyperparams_hifigan.py` |
+| Diffusion vocoder | DiffWave-like neural vocoder that samples waveform from mel conditioning through a diffusion schedule. | `tts_diffusion_vocoder_train.py`, `tts_diffusion_vocoder_synthesis.py`; acoustic synthesis scripts with `--backend diffusion` | `hyperparams_diffusion_vocoder.py` |
+
+### Shared infrastructure
+
+- Dataset loading and length-aware batching
+- Text normalization and symbol processing
+- Shared Tacotron-style losses and validation metrics
+- Reproducibility helpers from `tts_seed.py`
 
 ## Configuration Files
 
