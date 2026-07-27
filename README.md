@@ -79,7 +79,7 @@ outputs/
   checkpoints/{rnn,transformer,mamba,mel2mag,vocoder,hifigan}/
   logs/{rnn,transformer,mamba}/
   samples/{rnn,transformer,mamba}/
-  synthesis/{rnn,transformer,mamba}/
+  synthesis/{model}_{backend}/
 ```
 
 All three acoustic trainers print aligned epoch summaries:
@@ -132,6 +132,11 @@ All synthesis scripts support these waveform backends:
 - `griffinlim` - requires a MelToMag checkpoint
 - `hifigan` - requires a HiFi-GAN generator checkpoint
 - `diffusion` - requires a diffusion vocoder checkpoint
+
+By default, synthesis artifacts are saved under `outputs/synthesis/{model}_{backend}`,
+for example `outputs/synthesis/rnn_hifigan`,
+`outputs/synthesis/transformer_griffinlim`, or
+`outputs/synthesis/mamba_diffusion`. Passing `--out_dir` overrides this default.
 
 ### RNN Tacotron2
 

@@ -473,7 +473,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diffusion_steps", type=int, default=int(diffusion_hp_get("diffusion_vocoder_inference_steps", 50)), help="Diffusion sampling steps")
 
     parser.add_argument("--strict", action="store_true", help="Use strict=True when loading checkpoints")
-    parser.add_argument("--out_dir", type=str, default=getattr(hp, "synthesis_path", getattr(hp, "sample_path", "./outputs/synthesis/rnn")), help="Output directory")
+    parser.add_argument("--out_dir", type=str, default=None, help="Output directory. Defaults to outputs/synthesis/rnn_<backend>.")
     parser.add_argument("--save_png", action="store_true", help="Save mel spectrogram PNGs")
     parser.add_argument("--save_mag_png", action="store_true", help="Save magnitude spectrogram PNGs")
     parser.add_argument("--save_alignment", action="store_true", help="Save alignment PNG")
@@ -482,7 +482,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--peak_norm", action="store_true", help="Normalize waveform peak after gain")
     parser.add_argument("--peak_target", type=float, default=0.95, help="Target absolute peak when --peak_norm is enabled")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.out_dir is None:
+        synthesis_root = Path(getattr(hp, "synthesis_root", "./outputs/synthesis"))
+        args.out_dir = str(synthesis_root / f"rnn_{args.backend}")
+    return args
 
 
 def collect_input_texts(args: argparse.Namespace) -> List[str]:
@@ -512,6 +516,7 @@ def main() -> None:
 
     print(f"Using device       : {device}")
     print(f"Backend            : {args.backend}")
+    print(f"Output dir         : {args.out_dir}")
     print(f"Tacotron checkpoint: {tacotron_ckpt}")
     print(f"WAV gain           : {args.wav_gain}")
     print(f"Peak norm          : {args.peak_norm}")

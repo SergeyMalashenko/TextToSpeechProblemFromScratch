@@ -325,7 +325,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hifigan_ckpt", type=str, default=None)
     parser.add_argument("--diffusion_ckpt", type=str, default=None)
     parser.add_argument("--diffusion_steps", type=int, default=int(diffusion_hp_get("diffusion_vocoder_inference_steps", 50)))
-    parser.add_argument("--out_dir", type=str, default=getattr(hp, "synthesis_path", getattr(hp, "sample_path", "./outputs/synthesis/transformer")))
+    parser.add_argument("--out_dir", type=str, default=None, help="Output directory. Defaults to outputs/synthesis/transformer_<backend>.")
     parser.add_argument("--spell_plate", action="store_true")
     parser.add_argument("--save_png", action="store_true")
     parser.add_argument("--save_alignment", action="store_true")
@@ -335,7 +335,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--peak_norm", action="store_true")
     parser.add_argument("--peak_target", type=float, default=0.95)
     parser.add_argument("--strict", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.out_dir is None:
+        synthesis_root = Path(getattr(hp, "synthesis_root", "./outputs/synthesis"))
+        args.out_dir = str(synthesis_root / f"transformer_{args.backend}")
+    return args
 
 def main() -> None:
     args = parse_args()
@@ -344,6 +348,7 @@ def main() -> None:
     print(f"Using device          : {device}")
     print(f"Transformer checkpoint: {transformer_ckpt}")
     print(f"Backend               : {args.backend}")
+    print(f"Output dir            : {args.out_dir}")
 
     transformer_model = load_transformer_model(transformer_ckpt, device, args.strict)
 
