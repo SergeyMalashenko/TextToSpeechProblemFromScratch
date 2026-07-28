@@ -69,6 +69,7 @@ TRANSFORMER_NHEAD = hp_get("transformer_nhead", 4)
 TRANSFORMER_ENCODER_LAYERS = hp_get("transformer_encoder_layers", 4)
 TRANSFORMER_DECODER_LAYERS = hp_get("transformer_decoder_layers", 4)
 TRANSFORMER_FFN_DIM = hp_get("transformer_ffn_dim", 1024)
+TRANSFORMER_FFN_TYPE = hp_get("transformer_ffn_type", "swiglu")
 TRANSFORMER_DROPOUT = hp_get("transformer_dropout", 0.1)
 
 PRENET_DIMS = hp_get("prenet_dims", [256, 256])
@@ -180,6 +181,67 @@ class Postnet(nn.Module):
         return x.transpose(1, 2)
 
 
+class FeedForward(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+        if TRANSFORMER_FFN_TYPE == "relu":
+            self.net = nn.Sequential(
+                nn.Linear(TRANSFORMER_D_MODEL, TRANSFORMER_FFN_DIM),
+                nn.ReLU(),
+                nn.Dropout(TRANSFORMER_DROPOUT),
+                nn.Linear(TRANSFORMER_FFN_DIM, TRANSFORMER_D_MODEL),
+            )
+        elif TRANSFORMER_FFN_TYPE == "swiglu":
+            self.net = None
+            self.input_proj = nn.Linear(TRANSFORMER_D_MODEL, TRANSFORMER_FFN_DIM * 2)
+            self.dropout = nn.Dropout(TRANSFORMER_DROPOUT)
+            self.output_proj = nn.Linear(TRANSFORMER_FFN_DIM, TRANSFORMER_D_MODEL)
+        else:
+            raise ValueError(f"Unknown transformer_ffn_type: {TRANSFORMER_FFN_TYPE}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.net is not None:
+            return self.net(x)
+
+        value, gate = self.input_proj(x).chunk(2, dim=-1)
+        x = value * F.silu(gate)
+        x = self.dropout(x)
+        return self.output_proj(x)
+
+
+class TransformerEncoderLayerWithAttention(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=TRANSFORMER_D_MODEL,
+            num_heads=TRANSFORMER_NHEAD,
+            dropout=TRANSFORMER_DROPOUT,
+            batch_first=True,
+        )
+        self.ffn = FeedForward()
+        self.norm1 = nn.LayerNorm(TRANSFORMER_D_MODEL)
+        self.norm2 = nn.LayerNorm(TRANSFORMER_D_MODEL)
+        self.dropout = nn.Dropout(TRANSFORMER_DROPOUT)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        residual = x
+        y = self.norm1(x)
+        y, _ = self.self_attn(
+            y,
+            y,
+            y,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = residual + self.dropout(y)
+
+        residual = x
+        y = self.norm2(x)
+        y = self.ffn(y)
+        return residual + self.dropout(y)
+
+
 class TransformerEncoder(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -190,32 +252,22 @@ class TransformerEncoder(nn.Module):
             dropout=TRANSFORMER_DROPOUT,
         )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=TRANSFORMER_D_MODEL,
-            nhead=TRANSFORMER_NHEAD,
-            dim_feedforward=TRANSFORMER_FFN_DIM,
-            dropout=TRANSFORMER_DROPOUT,
-            activation="relu",
-            batch_first=True,
-            norm_first=True,
-        )
-
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer=encoder_layer,
-            num_layers=TRANSFORMER_ENCODER_LAYERS,
-            enable_nested_tensor=False,
-        )
+        self.layers = nn.ModuleList([TransformerEncoderLayerWithAttention() for _ in range(TRANSFORMER_ENCODER_LAYERS)])
 
     def forward(self, x: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
         x = self.input_proj(x)
         x = self.positional_encoding(x)
         src_key_padding_mask = get_mask_from_lengths(input_lengths, max_len=x.size(1))
-        return self.encoder(x, src_key_padding_mask=src_key_padding_mask)
+        for layer in self.layers:
+            x = layer(x, key_padding_mask=src_key_padding_mask)
+        return x
 
     def inference(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input_proj(x)
         x = self.positional_encoding(x)
-        return self.encoder(x)
+        for layer in self.layers:
+            x = layer(x, key_padding_mask=None)
+        return x
 
 
 class TransformerDecoderLayerWithAttention(nn.Module):
@@ -235,15 +287,13 @@ class TransformerDecoderLayerWithAttention(nn.Module):
             batch_first=True,
         )
 
-        self.linear1 = nn.Linear(TRANSFORMER_D_MODEL, TRANSFORMER_FFN_DIM)
-        self.linear2 = nn.Linear(TRANSFORMER_FFN_DIM, TRANSFORMER_D_MODEL)
+        self.ffn = FeedForward()
 
         self.norm1 = nn.LayerNorm(TRANSFORMER_D_MODEL)
         self.norm2 = nn.LayerNorm(TRANSFORMER_D_MODEL)
         self.norm3 = nn.LayerNorm(TRANSFORMER_D_MODEL)
 
         self.dropout = nn.Dropout(TRANSFORMER_DROPOUT)
-        self.dropout_ff = nn.Dropout(TRANSFORMER_DROPOUT)
 
     def forward(
         self,
@@ -275,7 +325,7 @@ class TransformerDecoderLayerWithAttention(nn.Module):
 
         residual = tgt
         x = self.norm3(tgt)
-        x = self.linear2(self.dropout_ff(F.relu(self.linear1(x))))
+        x = self.ffn(x)
         tgt = residual + self.dropout(x)
 
         return tgt, cross_attn_weights
