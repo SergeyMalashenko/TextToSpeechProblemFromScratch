@@ -72,6 +72,7 @@ TRANSFORMER_FFN_DIM = hp_get("transformer_ffn_dim", 1024)
 TRANSFORMER_FFN_TYPE = hp_get("transformer_ffn_type", "swiglu")
 TRANSFORMER_POSITIONAL_ENCODING = hp_get("transformer_positional_encoding", "sinusoidal")
 TRANSFORMER_DROPOUT = hp_get("transformer_dropout", 0.1)
+TRANSFORMER_LAYERSCALE_INIT = hp_get("transformer_layerscale_init", 0.0)
 
 # RoPE positional encoding experiment note:
 # The run looked better with softer guided-attention pressure:
@@ -235,6 +236,15 @@ class FeedForward(nn.Module):
         return self.output_proj(x)
 
 
+class LayerScale(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.full((TRANSFORMER_D_MODEL,), float(TRANSFORMER_LAYERSCALE_INIT)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.scale
+
+
 class StandardSelfAttention(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -370,6 +380,8 @@ class TransformerEncoderLayerWithAttention(nn.Module):
         self.norm1 = nn.LayerNorm(TRANSFORMER_D_MODEL)
         self.norm2 = nn.LayerNorm(TRANSFORMER_D_MODEL)
         self.dropout = nn.Dropout(TRANSFORMER_DROPOUT)
+        self.self_attn_scale = LayerScale()
+        self.ffn_scale = LayerScale()
 
     def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
         residual = x
@@ -378,12 +390,12 @@ class TransformerEncoderLayerWithAttention(nn.Module):
             y,
             key_padding_mask=key_padding_mask,
         )
-        x = residual + self.dropout(y)
+        x = residual + self.self_attn_scale(self.dropout(y))
 
         residual = x
         y = self.norm2(x)
         y = self.ffn(y)
-        return residual + self.dropout(y)
+        return residual + self.ffn_scale(self.dropout(y))
 
 
 class TransformerEncoder(nn.Module):
@@ -433,6 +445,9 @@ class TransformerDecoderLayerWithAttention(nn.Module):
         self.norm3 = nn.LayerNorm(TRANSFORMER_D_MODEL)
 
         self.dropout = nn.Dropout(TRANSFORMER_DROPOUT)
+        self.self_attn_scale = LayerScale()
+        self.cross_attn_scale = LayerScale()
+        self.ffn_scale = LayerScale()
 
     def forward(
         self,
@@ -449,7 +464,7 @@ class TransformerDecoderLayerWithAttention(nn.Module):
             attn_mask=tgt_mask,
             key_padding_mask=tgt_key_padding_mask,
         )
-        tgt = residual + self.dropout(x)
+        tgt = residual + self.self_attn_scale(self.dropout(x))
 
         residual = tgt
         x = self.norm2(tgt)
@@ -459,12 +474,12 @@ class TransformerDecoderLayerWithAttention(nn.Module):
             need_weights=True,
             average_attn_weights=False,
         )
-        tgt = residual + self.dropout(x)
+        tgt = residual + self.cross_attn_scale(self.dropout(x))
 
         residual = tgt
         x = self.norm3(tgt)
         x = self.ffn(x)
-        tgt = residual + self.dropout(x)
+        tgt = residual + self.ffn_scale(self.dropout(x))
 
         return tgt, cross_attn_weights
 
