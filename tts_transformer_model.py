@@ -73,6 +73,13 @@ TRANSFORMER_FFN_TYPE = hp_get("transformer_ffn_type", "swiglu")
 TRANSFORMER_POSITIONAL_ENCODING = hp_get("transformer_positional_encoding", "sinusoidal")
 TRANSFORMER_DROPOUT = hp_get("transformer_dropout", 0.1)
 
+# RoPE positional encoding experiment note:
+# The run looked better with softer guided-attention pressure:
+# guided_attn_weight_start = 1.0
+# guided_attn_weight_end = 0.1
+# guided_attn_warmup_epochs = 50
+# guided_attn_decay_epochs = 300
+
 PRENET_DIMS = hp_get("prenet_dims", [256, 256])
 
 POSTNET_EMBED_DIM = hp_get("postnet_embedding_dim", 512)
