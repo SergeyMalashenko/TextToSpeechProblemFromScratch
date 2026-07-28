@@ -113,28 +113,20 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class LearnedPositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int, dropout: float = 0.1) -> None:
+class NoAdditivePositionalEncoding(nn.Module):
+    def __init__(self, dropout: float = 0.1) -> None:
         super().__init__()
         self.dropout = nn.Dropout(dropout)
-        self.embedding = nn.Embedding(max_len, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.size(1) > self.embedding.num_embeddings:
-            raise ValueError(
-                f"Sequence length {x.size(1)} exceeds positional encoding limit "
-                f"{self.embedding.num_embeddings}"
-            )
-        positions = torch.arange(x.size(1), device=x.device)
-        x = x + self.embedding(positions).unsqueeze(0).to(dtype=x.dtype)
         return self.dropout(x)
 
 
 def build_positional_encoding(d_model: int, max_len: int, dropout: float) -> nn.Module:
     if TRANSFORMER_POSITIONAL_ENCODING == "sinusoidal":
         return PositionalEncoding(d_model=d_model, max_len=max_len, dropout=dropout)
-    if TRANSFORMER_POSITIONAL_ENCODING == "learned":
-        return LearnedPositionalEncoding(d_model=d_model, max_len=max_len, dropout=dropout)
+    if TRANSFORMER_POSITIONAL_ENCODING == "rope":
+        return NoAdditivePositionalEncoding(dropout=dropout)
     raise ValueError(f"Unknown transformer_positional_encoding: {TRANSFORMER_POSITIONAL_ENCODING}")
 
 
@@ -236,15 +228,137 @@ class FeedForward(nn.Module):
         return self.output_proj(x)
 
 
-class TransformerEncoderLayerWithAttention(nn.Module):
+class StandardSelfAttention(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(
+        self.attn = nn.MultiheadAttention(
             embed_dim=TRANSFORMER_D_MODEL,
             num_heads=TRANSFORMER_NHEAD,
             dropout=TRANSFORMER_DROPOUT,
             batch_first=True,
         )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        y, _ = self.attn(
+            x,
+            x,
+            x,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        return y
+
+
+class RotarySelfAttention(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.num_heads = TRANSFORMER_NHEAD
+        self.head_dim = TRANSFORMER_D_MODEL // TRANSFORMER_NHEAD
+        if self.head_dim % 2 != 0:
+            raise ValueError(f"RoPE requires an even attention head dim, got {self.head_dim}")
+
+        self.qkv_proj = nn.Linear(TRANSFORMER_D_MODEL, TRANSFORMER_D_MODEL * 3)
+        self.out_proj = nn.Linear(TRANSFORMER_D_MODEL, TRANSFORMER_D_MODEL)
+        self.dropout_p = TRANSFORMER_DROPOUT
+
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def apply_rope(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.size(-2)
+        positions = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+        angles = torch.outer(positions, self.inv_freq).to(dtype=x.dtype)
+        cos = torch.cos(angles).view(1, 1, seq_len, -1)
+        sin = torch.sin(angles).view(1, 1, seq_len, -1)
+
+        x_pair = x.view(*x.shape[:-1], self.head_dim // 2, 2)
+        x_even = x_pair[..., 0]
+        x_odd = x_pair[..., 1]
+        x_rotated = torch.stack(
+            (
+                x_even * cos - x_odd * sin,
+                x_even * sin + x_odd * cos,
+            ),
+            dim=-1,
+        )
+        return x_rotated.flatten(-2)
+
+    def build_attention_mask(
+        self,
+        attn_mask: Optional[torch.Tensor],
+        key_padding_mask: Optional[torch.Tensor],
+        batch_size: int,
+        target_len: int,
+        source_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if attn_mask is None and key_padding_mask is None:
+            return None
+
+        mask = torch.zeros(batch_size, 1, target_len, source_len, device=device, dtype=dtype)
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(device=device)
+            if attn_mask.dtype == torch.bool:
+                mask = mask.masked_fill(attn_mask.view(1, 1, target_len, source_len), float("-inf"))
+            else:
+                mask = mask + attn_mask.to(dtype=dtype).view(1, 1, target_len, source_len)
+        if key_padding_mask is not None:
+            mask = mask.masked_fill(key_padding_mask.view(batch_size, 1, 1, source_len), float("-inf"))
+        return mask
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        qkv = self.qkv_proj(x)
+        qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+
+        q = self.apply_rope(q.transpose(1, 2))
+        k = self.apply_rope(k.transpose(1, 2))
+        v = v.transpose(1, 2)
+
+        attention_mask = self.build_attention_mask(
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            batch_size=batch_size,
+            target_len=seq_len,
+            source_len=seq_len,
+            device=x.device,
+            dtype=q.dtype,
+        )
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attention_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+        )
+        y = y.transpose(1, 2).contiguous().view(batch_size, seq_len, TRANSFORMER_D_MODEL)
+        return self.out_proj(y)
+
+
+def build_self_attention() -> nn.Module:
+    if TRANSFORMER_POSITIONAL_ENCODING == "rope":
+        return RotarySelfAttention()
+    return StandardSelfAttention()
+
+
+class TransformerEncoderLayerWithAttention(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.self_attn = build_self_attention()
         self.ffn = FeedForward()
         self.norm1 = nn.LayerNorm(TRANSFORMER_D_MODEL)
         self.norm2 = nn.LayerNorm(TRANSFORMER_D_MODEL)
@@ -253,12 +367,9 @@ class TransformerEncoderLayerWithAttention(nn.Module):
     def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
         residual = x
         y = self.norm1(x)
-        y, _ = self.self_attn(
-            y,
-            y,
+        y = self.self_attn(
             y,
             key_padding_mask=key_padding_mask,
-            need_weights=False,
         )
         x = residual + self.dropout(y)
 
@@ -300,12 +411,7 @@ class TransformerDecoderLayerWithAttention(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=TRANSFORMER_D_MODEL,
-            num_heads=TRANSFORMER_NHEAD,
-            dropout=TRANSFORMER_DROPOUT,
-            batch_first=True,
-        )
+        self.self_attn = build_self_attention()
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=TRANSFORMER_D_MODEL,
             num_heads=TRANSFORMER_NHEAD,
@@ -331,11 +437,10 @@ class TransformerDecoderLayerWithAttention(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = tgt
         x = self.norm1(tgt)
-        x, _ = self.self_attn(
-            x, x, x,
+        x = self.self_attn(
+            x,
             attn_mask=tgt_mask,
             key_padding_mask=tgt_key_padding_mask,
-            need_weights=False,
         )
         tgt = residual + self.dropout(x)
 
