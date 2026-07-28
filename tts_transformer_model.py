@@ -70,6 +70,7 @@ TRANSFORMER_ENCODER_LAYERS = hp_get("transformer_encoder_layers", 4)
 TRANSFORMER_DECODER_LAYERS = hp_get("transformer_decoder_layers", 4)
 TRANSFORMER_FFN_DIM = hp_get("transformer_ffn_dim", 1024)
 TRANSFORMER_FFN_TYPE = hp_get("transformer_ffn_type", "swiglu")
+TRANSFORMER_POSITIONAL_ENCODING = hp_get("transformer_positional_encoding", "sinusoidal")
 TRANSFORMER_DROPOUT = hp_get("transformer_dropout", 0.1)
 
 PRENET_DIMS = hp_get("prenet_dims", [256, 256])
@@ -110,6 +111,31 @@ class PositionalEncoding(nn.Module):
             )
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)
+
+
+class LearnedPositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.embedding = nn.Embedding(max_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(1) > self.embedding.num_embeddings:
+            raise ValueError(
+                f"Sequence length {x.size(1)} exceeds positional encoding limit "
+                f"{self.embedding.num_embeddings}"
+            )
+        positions = torch.arange(x.size(1), device=x.device)
+        x = x + self.embedding(positions).unsqueeze(0).to(dtype=x.dtype)
+        return self.dropout(x)
+
+
+def build_positional_encoding(d_model: int, max_len: int, dropout: float) -> nn.Module:
+    if TRANSFORMER_POSITIONAL_ENCODING == "sinusoidal":
+        return PositionalEncoding(d_model=d_model, max_len=max_len, dropout=dropout)
+    if TRANSFORMER_POSITIONAL_ENCODING == "learned":
+        return LearnedPositionalEncoding(d_model=d_model, max_len=max_len, dropout=dropout)
+    raise ValueError(f"Unknown transformer_positional_encoding: {TRANSFORMER_POSITIONAL_ENCODING}")
 
 
 class Prenet(nn.Module):
@@ -246,7 +272,7 @@ class TransformerEncoder(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.input_proj = nn.Linear(SYMBOL_EMBED_DIM, TRANSFORMER_D_MODEL)
-        self.positional_encoding = PositionalEncoding(
+        self.positional_encoding = build_positional_encoding(
             d_model=TRANSFORMER_D_MODEL,
             max_len=MAX_TEXT_POSITIONS,
             dropout=TRANSFORMER_DROPOUT,
@@ -340,7 +366,7 @@ class TransformerDecoder(nn.Module):
 
         self.prenet = Prenet(N_MELS, PRENET_DIMS)
         self.prenet_proj = nn.Linear(PRENET_DIMS[-1], TRANSFORMER_D_MODEL)
-        self.positional_encoding = PositionalEncoding(
+        self.positional_encoding = build_positional_encoding(
             d_model=TRANSFORMER_D_MODEL,
             max_len=MAX_DECODER_STEPS + 8,
             dropout=TRANSFORMER_DROPOUT,
