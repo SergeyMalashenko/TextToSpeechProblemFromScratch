@@ -46,6 +46,7 @@ transformer_ffn_dim = 1024
 transformer_dropout = 0.1
 transformer_ffn_type = "swiglu"
 transformer_positional_encoding = "rope"  # "sinusoidal" or "rope"
+transformer_layerscale_init = 0.1
 
 max_text_positions = 2048
 
