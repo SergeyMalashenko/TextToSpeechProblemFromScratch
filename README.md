@@ -15,7 +15,7 @@ attention alignments, and can be used with the same synthesis backends.
 | Model | Main idea | Entry points | Configuration |
 | --- | --- | --- | --- |
 | RNN Tacotron2 | Classic autoregressive Tacotron2 with recurrent decoder and location-sensitive attention. | `tts_rnn_train.py`, `tts_rnn_synthesis.py` | `hyperparams_rnn.py` |
-| Transformer Tacotron | Tacotron-style encoder/decoder built around Transformer attention with separate decoder layers. | `tts_transformer_train.py`, `tts_transformer_synthesis.py` | `hyperparams_transformer.py` |
+| Transformer Tacotron | Tacotron-style encoder/decoder with separate Transformer decoder layers, SwiGLU FFN, and configurable self-attention positional encoding. | `tts_transformer_train.py`, `tts_transformer_synthesis.py` | `hyperparams_transformer.py` |
 | Mamba3 Tacotron-style model | Mamba3-based acoustic model for comparison with the RNN and Transformer paths. | `tts_mamba_train.py`, `tts_mamba_synthesis.py` | `hyperparams_mamba.py` |
 
 ### Vocoders and waveform reconstruction
@@ -36,6 +36,17 @@ training complexity.
 - Text normalization and symbol processing
 - Shared Tacotron-style losses and validation metrics
 - Reproducibility helpers from `tts_seed.py`
+
+Current Transformer behavior:
+
+- FFN blocks use `transformer_ffn_type = "swiglu"`.
+- Self-attention positional encoding is controlled by
+  `transformer_positional_encoding`.
+- Supported Transformer positional modes are `sinusoidal` and `rope`.
+- The default Transformer positional mode is currently `rope`.
+- RoPE is applied only to encoder/decoder self-attention; decoder cross-attention
+  stays standard so alignment weights remain available for guided attention,
+  metrics, and visualization.
 
 ## Configuration Files
 
