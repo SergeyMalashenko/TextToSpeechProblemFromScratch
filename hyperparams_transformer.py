@@ -84,6 +84,7 @@ lr_decay_factor_2 = 0.25
 # Epoch-based training schedule and logging
 # =============================================================================
 
+autoregressive_val_samples = 4  # fixed validation examples for attention-path checks
 val_every_epoch = 5
 image_every_epoch = 5
 sample_every_epoch = 25

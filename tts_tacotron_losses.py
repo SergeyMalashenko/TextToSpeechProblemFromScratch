@@ -30,6 +30,8 @@ def masked_l1_loss(
     pred, target: (B, T, C)
     lengths: (B,)
     """
+    # FP32 reductions avoid overflowing the number of valid spectrogram bins in AMP.
+    pred, target = pred.float(), target.float()
     mask = sequence_mask(lengths, max_len=pred.size(1)).unsqueeze(-1).to(pred.dtype)
     loss = torch.abs(pred - target) * mask
     denom = mask.sum() * pred.size(-1)
@@ -80,6 +82,8 @@ def guided_attention_loss(
 
     We only compute over valid alignment area.
     """
+    # T_mel * T_text (or its batch sum) can exceed the FP16 limit of 65504.
+    alignments = alignments.float()
     B, T_mel_max, T_text_max = alignments.shape
     total_loss = alignments.new_tensor(0.0)
     total_weight = alignments.new_tensor(0.0)

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +16,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from scipy import signal
 from scipy.io.wavfile import write
 
@@ -24,6 +26,7 @@ import hyperparams_diffusion_vocoder as hp_diffusion
 from text import text_to_sequence
 
 from tts_transformer_model import TransformerTacotron2
+from tts_transformer_config import check_checkpoint_config
 
 MEL2MAG_CLASS = None
 HIFIGAN_CLASS = None
@@ -131,10 +134,22 @@ def load_checkpoint_state(path: str | Path, device: torch.device) -> Dict[str, t
     return cleaned
 
 def resolve_transformer_checkpoint(arg_value: str | None) -> Path:
-    if arg_value: return Path(arg_value)
-    step = hp_get("restore_transformer_step", None)
-    if step is None: raise ValueError("Transformer checkpoint is not provided. Use --transformer_ckpt.")
-    return Path(hp.checkpoint_path) / f"checkpoint_transformer_tacotron2_{step}.pth.tar"
+    if arg_value:
+        return Path(arg_value)
+    epoch = hp_get("restore_transformer_epoch", None)
+    if epoch is None:
+        raise ValueError("Transformer checkpoint is not provided. Use --transformer_ckpt.")
+    filename = f"checkpoint_transformer_tacotron2_epoch_{int(epoch):04d}.pth.tar"
+    root = Path(hp.checkpoint_path)
+    # Support both older flat directories and the current per-experiment layout.
+    if (root / filename).is_file():
+        return root / filename
+    matches = sorted(path for path in root.glob(f"*/{filename}") if path.is_file())
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FileNotFoundError(f"No Transformer checkpoint for epoch {epoch} under {root}")
+    raise ValueError("Several experiments contain this epoch. Select one with --transformer_ckpt.")
 
 def resolve_mel2mag_checkpoint(arg_value: str | None) -> Path:
     if arg_value: return Path(arg_value)
@@ -156,8 +171,13 @@ def resolve_diffusion_checkpoint(arg_value: str | None) -> Path:
 
 def load_transformer_model(transformer_ckpt: str | Path, device: torch.device, strict: bool = True) -> TransformerTacotron2:
     model = TransformerTacotron2().to(device).eval()
-    sd = load_checkpoint_state(transformer_ckpt, device=device)
-    model.load_state_dict(sd, strict=strict)
+    checkpoint = torch.load(Path(transformer_ckpt), map_location=device)
+    check_checkpoint_config(checkpoint.get("model_config"))
+    sd = checkpoint.get("model", checkpoint)
+    consume_prefix_in_state_dict_if_present(sd, "module.")
+    incompatible = model.load_state_dict(sd, strict=strict)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        warnings.warn(f"Partial Transformer load: {incompatible}")
     return model
 
 def load_mel2mag_model(mel2mag_ckpt: str | Path, device: torch.device, strict: bool = True):
@@ -277,6 +297,10 @@ def synthesize_one(source_text: str, transformer_model: TransformerTacotron2, ou
 
     wav = apply_wav_postprocessing(wav, wav_gain, peak_norm, peak_target)
     sr = int(sample_rate if sample_rate is not None else hp.sr)
+    if sr <= 0:
+        raise ValueError("Sample rate must be positive")
+    if sr != int(hp.sr):
+        wav = librosa.resample(wav, orig_sr=int(hp.sr), target_sr=sr)
 
     wav_path = wav_dir / f"{file_stem}.wav"
     mel_before_path = mel_dir / f"{file_stem}.mel_before.npy"
@@ -333,7 +357,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wav_gain", type=float, default=1.0)
     parser.add_argument("--peak_norm", action="store_true")
     parser.add_argument("--peak_target", type=float, default=0.95)
-    parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--strict", action="store_true", default=True, help="Require matching checkpoint keys (default).")
+    parser.add_argument("--allow_partial", action="store_false", dest="strict", help="Allow missing/unexpected keys with a warning.")
     args = parser.parse_args()
     if args.out_dir is None:
         synthesis_root = Path(getattr(hp, "synthesis_root", "./outputs/synthesis"))

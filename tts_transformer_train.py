@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import math
+import json
+from dataclasses import asdict
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +13,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
@@ -22,6 +25,7 @@ from tts_dataset import (
 
 
 from tts_transformer_model import TransformerTacotron2
+from tts_transformer_config import build_transformer_tacotron_config, check_checkpoint_config
 from tts_tacotron_losses import Tacotron2Loss, sequence_mask
 from tts_seed import make_torch_generator, seed_worker, set_seed
 
@@ -213,14 +217,17 @@ class GuidedAttentionScheduler:
 
 
 @torch.no_grad()
-def compute_gate_metrics(gate_logits: torch.Tensor, gate_target: torch.Tensor, output_lengths: torch.Tensor, threshold: float = 0.5) -> Dict[str, float]:
+def compute_gate_metrics(gate_logits: torch.Tensor, gate_target: torch.Tensor, output_lengths: torch.Tensor, threshold: Optional[float] = None) -> Dict[str, float]:
+    if threshold is None:
+        threshold = float(hp_get("gate_threshold", 0.5))
     probs = torch.sigmoid(gate_logits)
+    valid = sequence_mask(output_lengths, max_len=gate_logits.size(1))
     pred = probs > threshold
     target = gate_target > 0.5
-    tp = (pred & target).sum().item()
-    fp = (pred & (~target)).sum().item()
-    fn = ((~pred) & target).sum().item()
-    tn = ((~pred) & (~target)).sum().item()
+    tp = (pred & target & valid).sum().item()
+    fp = (pred & (~target) & valid).sum().item()
+    fn = ((~pred) & target & valid).sum().item()
+    tn = ((~pred) & (~target) & valid).sum().item()
     acc = (tp + tn) / max(1, tp + tn + fp + fn)
     prec = tp / max(1, tp + fp)
     rec = tp / max(1, tp + fn)
@@ -347,12 +354,13 @@ def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, scaler: 
         "scaler": scaler.state_dict(),
         "epoch": epoch,
         "global_step": global_step,
+        "model_config": asdict(build_transformer_tacotron_config()),
     }, path)
 
 
 def cleanup_old_checkpoints(checkpoint_dir: str | Path, keep_last_n: int) -> None:
     checkpoint_dir = Path(checkpoint_dir)
-    if not checkpoint_dir.exists():
+    if keep_last_n <= 0 or not checkpoint_dir.exists():
         return
     checkpoints = sorted(
         checkpoint_dir.glob("checkpoint_transformer_tacotron2_epoch_*.pth.tar"),
@@ -375,6 +383,8 @@ def maybe_resume_from_checkpoint(model: nn.Module, optimizer: torch.optim.Optimi
         raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
 
     checkpoint = torch.load(resume_path, map_location=device)
+    check_checkpoint_config(checkpoint.get("model_config"))
+    consume_prefix_in_state_dict_if_present(checkpoint["model"], "module.")
     unwrap_model(model).load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     if "scaler" in checkpoint:
@@ -403,9 +413,12 @@ def save_validation_sample(model: nn.Module, dataset, device: torch.device, save
     text_lengths = torch.tensor([sample["text_length"]], dtype=torch.long, device=device)
 
     model_w = unwrap_model(model)
+    was_training = model_w.training
     model_w.eval()
-    outputs = model_w.inference(text=text, text_lengths=text_lengths)
-    model_w.train()
+    try:
+        outputs = diagnostic_inference(model_w, text, text_lengths, device)
+    finally:
+        model_w.train(was_training)
 
     torch.save(outputs["mel_after"][0].detach().cpu(), save_dir / f"transformer_sample_mel_epoch_{epoch:04d}.pt")
     torch.save(outputs["alignments"][0].detach().cpu(), save_dir / f"transformer_sample_align_epoch_{epoch:04d}.pt")
@@ -456,6 +469,32 @@ def train_one_step(model: nn.Module, criterion: Tacotron2Loss, optimizer: torch.
 
 
 @torch.no_grad()
+def compute_attention_path_metrics(alignments: torch.Tensor) -> Dict[str, float]:
+    """Describe the argmax attention path, without claiming to measure pronunciation."""
+    positions = alignments.argmax(dim=-1)
+    steps = positions[1:] - positions[:-1]
+    return {
+        "ar_text_coverage": float(positions.unique().numel() / alignments.size(1)),
+        "ar_final_position_ratio": float((positions[-1].item() + 1) / alignments.size(1)),
+        "ar_backward_jump_rate": float((steps < 0).float().mean().item()) if steps.numel() else 0.0,
+        "ar_forward_skip_rate": float((steps > 1).float().mean().item()) if steps.numel() else 0.0,
+    }
+
+
+@torch.no_grad()
+def diagnostic_inference(model, text, text_lengths, device):
+    # Prenet deliberately keeps dropout in eval. A local seed makes comparisons
+    # repeatable without consuming the training RNG state.
+    devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.random.default_generator.manual_seed(get_seed())
+        if devices:
+            with torch.cuda.device(devices[0]):
+                torch.cuda.manual_seed(get_seed())
+        return model.inference(text=text, text_lengths=text_lengths)
+
+
+@torch.no_grad()
 def compute_autoregressive_metrics(
     model: nn.Module,
     batch: Dict[str, torch.Tensor],
@@ -470,25 +509,21 @@ def compute_autoregressive_metrics(
     target_frames = int(batch["output_lengths"][0].item())
 
     try:
-        outputs = model_w.inference(text=text, text_lengths=text_lengths)
+        outputs = diagnostic_inference(model_w, text, text_lengths, device)
         alignments = outputs["alignments"][0]
         gate = outputs["gate"][0]
         generated_frames = int(alignments.size(0))
         text_length = int(text_lengths[0].item())
 
-        valid_alignments = alignments[:, :text_length]
-        positions = valid_alignments.argmax(dim=-1)
-        backward_jumps = (positions[1:] < positions[:-1]).float().mean() if positions.numel() > 1 else positions.new_tensor(0.0)
-        final_position = int(positions[-1].item()) if positions.numel() > 0 else 0
-        coverage = (final_position + 1) / max(1, text_length)
+        stopped_by_gate = bool(gate.numel() and torch.sigmoid(gate[-1]).item() > float(hp.gate_threshold))
 
         return {
             "ar_generated_frames": float(generated_frames),
             "ar_target_frames": float(target_frames),
             "ar_length_ratio": float(generated_frames / max(1, target_frames)),
             "ar_gate_last_prob": float(torch.sigmoid(gate[-1]).item()) if gate.numel() > 0 else 0.0,
-            "ar_text_coverage": float(coverage),
-            "ar_backward_jump_rate": float(backward_jumps.item()),
+            **compute_attention_path_metrics(alignments[:, :text_length]),
+            "ar_hit_max_steps": float(generated_frames >= int(hp.max_decoder_steps) and not stopped_by_gate),
         }
     finally:
         if was_training:
@@ -501,16 +536,19 @@ def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader,
     set_guided_attn_weight(criterion, guided_attn_weight)
     totals = defaultdict(float)
     n_batches = 0
-    autoregressive_batch = None
+    total_frames = 0
+    mel_loss_sums = defaultdict(float)
+    autoregressive_batches = []
 
     for batch in tqdm(dataloader, desc="validation", leave=False):
         batch = move_batch_to_device(batch, device)
-        if autoregressive_batch is None:
-            autoregressive_batch = {
-                "text": batch["text"][:1].detach().cpu(),
-                "text_lengths": batch["text_lengths"][:1].detach().cpu(),
-                "output_lengths": batch["output_lengths"][:1].detach().cpu(),
-            }
+        for index in range(batch["text"].size(0)):
+            if len(autoregressive_batches) >= int(hp_get("autoregressive_val_samples", 4)):
+                break
+            autoregressive_batches.append({
+                key: batch[key][index:index + 1].detach().cpu()
+                for key in ("text", "text_lengths", "output_lengths")
+            })
         with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
             outputs = model(
                 text=batch["text"],
@@ -541,19 +579,29 @@ def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader,
 
         for key, value in metrics.items():
             totals[key] += float(value)
+        frames = int(batch["output_lengths"].sum().item())
+        for key in ("mel_before_loss", "mel_after_loss", "mel_loss"):
+            mel_loss_sums[key] += metrics[key] * frames
+        total_frames += frames
         n_batches += 1
 
     if n_batches == 0:
         model.train()
         return {"loss": 0.0}
     metrics = {key: value / n_batches for key, value in totals.items()}
-    if autoregressive_batch is not None:
-        metrics.update(compute_autoregressive_metrics(model, autoregressive_batch, device))
+    for key, value in mel_loss_sums.items():
+        metrics[key] = value / max(1, total_frames)
+    metrics["loss"] = metrics["mel_loss"] + metrics["gate_loss"] + guided_attn_weight * metrics["attn_loss"]
+    if autoregressive_batches:
+        metrics.update(average_metric_dict([
+            compute_autoregressive_metrics(model, batch, device) for batch in autoregressive_batches
+        ]))
     model.train()
     return metrics
 
 
 def main() -> None:
+    build_transformer_tacotron_config().validate()
     seed = get_seed()
     set_seed(seed)
     device = get_device()
@@ -563,6 +611,8 @@ def main() -> None:
     print(f"AMP device type: {amp_device_type}")
 
     full_dataset = get_tacotron_dataset()
+    if len(full_dataset) < 2 or not 0 < get_val_ratio() < 1:
+        raise ValueError("Training needs at least two examples and 0 < val_ratio < 1")
     val_size = max(1, int(len(full_dataset) * get_val_ratio()))
     train_size = len(full_dataset) - val_size
 
@@ -602,7 +652,7 @@ def main() -> None:
             batch_size=int(hp.batch_size),
             shuffle=True,
             collate_fn=collate_fn_tacotron,
-            drop_last=True,
+            drop_last=False,
             num_workers=get_num_workers(),
             pin_memory=bool(hp_get("pin_memory", torch.cuda.is_available())),
             worker_init_fn=seed_worker,
@@ -640,12 +690,16 @@ def main() -> None:
 
     guided_attn_scheduler = GuidedAttentionScheduler()
 
-    checkpoint_dir = get_checkpoint_dir()
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_dir = create_experiment_log_dir(get_log_dir(), prefix="transformer")
+    checkpoint_dir = get_checkpoint_dir() / log_dir.name
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(log_dir))
-    sample_dir = get_samples_dir()
+    sample_dir = get_samples_dir() / log_dir.name
     sample_dir.mkdir(parents=True, exist_ok=True)
+    config = {key: value for key, value in vars(hp).items()
+              if not key.startswith("_") and isinstance(value, (str, int, float, bool, list, tuple, type(None)))}
+    (log_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    (log_dir / "split.json").write_text(json.dumps({"train": train_dataset.indices, "val": val_dataset.indices}), encoding="utf-8")
 
     resume_path = hp_get("resume_transformer_tacotron_path", None)
     start_epoch, global_step = maybe_resume_from_checkpoint(model, optimizer, scaler, resume_path, device)
@@ -667,8 +721,14 @@ def main() -> None:
     writer.add_text("config/base_lr", f"{float(hp.lr):.6e}", 0)
     writer.add_text("config/weight_decay", f"{get_weight_decay():.6e}", 0)
 
+    best_mel_loss = float("inf")
     for epoch in range(start_epoch, int(hp.epochs)):
         epoch_idx = epoch + 1
+        if use_bucket_sampler:
+            batch_sampler.set_epoch(epoch)
+        else:
+            train_loader.generator.manual_seed(seed + epoch)
+        model.train()
 
         current_lr = get_lr_by_epoch(epoch)
         set_optimizer_lr(optimizer, current_lr)
@@ -730,13 +790,15 @@ def main() -> None:
         if (epoch + 1) % get_sample_every_epoch() == 0:
             save_validation_sample(model, val_dataset, device, sample_dir, epoch_idx)
 
-        if (epoch + 1) % get_checkpoint_every_epoch() == 0:
+        if (epoch + 1) % get_checkpoint_every_epoch() == 0 or epoch_idx == int(hp.epochs):
             ckpt_path = checkpoint_dir / f"checkpoint_transformer_tacotron2_epoch_{epoch_idx:04d}.pth.tar"
             save_checkpoint(model, optimizer, scaler, epoch_idx, global_step, ckpt_path)
             cleanup_old_checkpoints(checkpoint_dir, keep_last_n=get_max_checkpoints_to_keep())
             print(f"Saved checkpoint: {ckpt_path}")
 
-        if (epoch + 1) % get_val_every_epoch() == 0:
+        save_checkpoint(model, optimizer, scaler, epoch_idx, global_step, checkpoint_dir / "transformer_last.pth.tar")
+
+        if (epoch + 1) % get_val_every_epoch() == 0 or epoch_idx == int(hp.epochs):
             val_guided_attn_weight = guided_attn_scheduler.get_weight(epoch)
             val_metrics = validate(model, criterion, val_loader, device, amp_device_type, val_guided_attn_weight)
 
@@ -755,6 +817,10 @@ def main() -> None:
                 f"ar_back={val_metrics['ar_backward_jump_rate']:.3f}"
             )
 
+            # Use the same mel objective even while the guided-attention weight changes.
+            if val_metrics["mel_after_loss"] < best_mel_loss:
+                best_mel_loss = val_metrics["mel_after_loss"]
+                save_checkpoint(model, optimizer, scaler, epoch_idx, global_step, checkpoint_dir / "transformer_best.pth.tar")
             for key, value in val_metrics.items():
                 writer.add_scalar(f"val/{key}", value, epoch_idx)
 

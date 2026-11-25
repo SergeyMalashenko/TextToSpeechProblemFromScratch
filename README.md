@@ -181,11 +181,13 @@ python tts_rnn_synthesis.py \
 
 ### Transformer Tacotron
 
+Replace `transformer_RUN` with the run directory printed during training.
+
 ```bash
 python tts_transformer_synthesis.py \
   --backend hifigan \
   --text "Hello world" \
-  --transformer_ckpt ./outputs/checkpoints/transformer/checkpoint_transformer_tacotron2_epoch_0100.pth.tar \
+  --transformer_ckpt ./outputs/checkpoints/transformer/transformer_RUN/transformer_best.pth.tar \
   --hifigan_ckpt ./outputs/checkpoints/hifigan/checkpoint_hifigan_epoch_0120.pth.tar
 ```
 
@@ -275,3 +277,44 @@ legacy reconstruction; existing feature files do not need regeneration.
 Run regression checks with `python -m unittest discover -s tests -v` in an environment
 with the project dependencies installed. Quality comparisons still require training
 on the same split and listening to both true-mel and predicted-mel synthesis.
+
+## Transformer teaching workflow
+
+The Transformer architecture and straightforward training loop are unchanged.
+Correctness checks are kept in the existing scripts:
+
+- Mel L1 and guided-attention reductions use FP32 to avoid FP16 overflow under AMP.
+- Gate metrics exclude padding and use the synthesis `gate_threshold`.
+- `ar_text_coverage` is the fraction of token positions visited by argmax attention.
+  `ar_final_position_ratio` separately reports how far the path reached;
+  `ar_forward_skip_rate` reports jumps over positions. These are attention-path
+  diagnostics, not pronunciation or intelligibility scores.
+- Up to `autoregressive_val_samples` fixed validation examples are decoded with a
+  local seed. Prenet's existing inference dropout is preserved. Validation mel
+  losses are weighted by valid frames; other logged metrics are batch averages.
+- The bucket sampler receives the epoch number, so its order changes each epoch.
+
+Each training invocation creates matching run subdirectories under Transformer
+logs, checkpoints, and samples. `config.json` and `split.json` are written beside
+TensorBoard logs. `transformer_last.pth.tar` is saved every epoch;
+`transformer_best.pth.tar` selects the lowest validation `mel_after_loss` in this
+invocation, independently of the changing guided-attention weight. The final epoch
+is always validated and saved. A resumed invocation gets a separate run directory;
+resume is not promised to reproduce dropout RNG bit for bit.
+
+New checkpoints include model configuration, checked against
+`hyperparams_transformer.py` during resume and synthesis, allowing changes to
+`gate_threshold` and `max_decoder_steps`. Weight keys prefixed with `module.` are
+accepted for compatibility with DataParallel checkpoints. Older checkpoints without
+configuration remain loadable with matching current hyperparameters. Synthesis
+requires matching parameter keys by default; `--allow_partial` explicitly permits
+missing/unexpected keys and emits a warning. `--sr` now resamples the waveform.
+For example, use `--transformer_ckpt
+./outputs/checkpoints/transformer/transformer_RUN/transformer_best.pth.tar` with the
+actual run directory printed by training. Alternatively, `restore_transformer_epoch`
+selects the matching numbered checkpoint in the checkpoint root or a single run
+subdirectory; if multiple runs match, pass `--transformer_ckpt` explicitly.
+
+There is no KV cache, profiler, or additional training framework. Run the small
+regression examples with `python -m unittest discover -s tests -v` after installing
+the project dependencies.

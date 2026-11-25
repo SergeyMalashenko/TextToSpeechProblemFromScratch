@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import List
 
-import hyperparams as hp
+import hyperparams_transformer as hp
 
 
 def hp_get(name: str, default):
@@ -68,6 +68,10 @@ class TransformerTacotronConfig:
     transformer_ffn_dim: int = field(default_factory=lambda: int(hp_get("transformer_ffn_dim", 1024)))
     transformer_dropout: float = field(default_factory=lambda: float(hp_get("transformer_dropout", 0.1)))
 
+    transformer_ffn_type: str = field(default_factory=lambda: str(hp_get("transformer_ffn_type", "swiglu")))
+    transformer_positional_encoding: str = field(default_factory=lambda: str(hp_get("transformer_positional_encoding", "rope")))
+    transformer_layerscale_init: float = field(default_factory=lambda: float(hp_get("transformer_layerscale_init", 0.1)))
+
     # Tacotron-like prenet/postnet
     prenet_dims: List[int] = field(default_factory=lambda: list(hp_get("prenet_dims", [256, 256])))
     postnet_embedding_dim: int = field(default_factory=lambda: int(hp_get("postnet_embedding_dim", 512)))
@@ -87,6 +91,18 @@ class TransformerTacotronConfig:
                 "This Transformer Tacotron configuration currently supports outputs_per_step=1 only."
             )
 
+        if self.transformer_d_model <= 0 or self.transformer_nhead <= 0:
+            raise ValueError("Model dimension and number of heads must be positive.")
+        if self.transformer_positional_encoding not in {"rope", "sinusoidal"}:
+            raise ValueError("Positional encoding must be rope or sinusoidal.")
+        if self.transformer_ffn_type not in {"relu", "swiglu"}:
+            raise ValueError("FFN type must be relu or swiglu.")
+        if self.transformer_positional_encoding == "rope" and (self.transformer_d_model // self.transformer_nhead) % 2:
+            raise ValueError("RoPE requires an even head dimension.")
+        if not 0 < self.gate_threshold <= 1:
+            raise ValueError("gate_threshold must be in (0, 1].")
+        if self.postnet_kernel_size <= 0 or self.postnet_kernel_size % 2 == 0:
+            raise ValueError("Postnet kernel size must be positive and odd.")
         if self.transformer_d_model % self.transformer_nhead != 0:
             raise ValueError(
                 f"transformer_d_model ({self.transformer_d_model}) must be divisible by "
@@ -118,6 +134,18 @@ def build_transformer_tacotron_config() -> TransformerTacotronConfig:
     cfg = TransformerTacotronConfig()
     cfg.validate()
     return cfg
+
+
+def check_checkpoint_config(saved_config: dict | None) -> None:
+    """Weights must match the architecture; decoding settings may change."""
+    if saved_config is None:  # older checkpoints have no configuration snapshot
+        return
+    current = asdict(build_transformer_tacotron_config())
+    decoding_settings = {"gate_threshold", "max_decoder_steps"}
+    saved = {key: value for key, value in saved_config.items() if key not in decoding_settings}
+    current = {key: value for key, value in current.items() if key not in decoding_settings}
+    if saved != current:
+        raise ValueError("Checkpoint architecture differs from hyperparams_transformer.py")
 
 
 if __name__ == "__main__":
