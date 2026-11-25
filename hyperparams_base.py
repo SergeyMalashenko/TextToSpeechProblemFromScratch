@@ -16,7 +16,8 @@ frame_length = 0.05
 hop_length = int(sr * frame_shift)
 win_length = int(sr * frame_length)
 
-power = 1.2
+power = 1.2  # legacy setting
+griffinlim_power = 1.0  # use 1.2 to compare legacy spectral sharpening
 min_level_db = -100
 ref_level_db = 20
 max_db = 100

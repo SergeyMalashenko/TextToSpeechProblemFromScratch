@@ -31,7 +31,7 @@ def spectrogram2wav(mag: np.ndarray) -> np.ndarray:
     mag = mag.T
     mag = (np.clip(mag, 0, 1) * hp.max_db) - hp.max_db + hp.ref_db
     mag = np.power(10.0, mag * 0.05)
-    wav = griffin_lim(mag ** hp.power)
+    wav = griffin_lim(mag ** getattr(hp, "griffinlim_power", 1.0))
     wav = signal.lfilter([1], [1, -hp.preemphasis], wav)
     wav, _ = librosa.effects.trim(wav)
     return wav.astype(np.float32)
@@ -275,8 +275,8 @@ def load_tacotron(path: str | Path, device: torch.device, strict: bool) -> Tacot
 
 
 def load_mel2mag(path: str | Path, device: torch.device, strict: bool) -> MelToMagModel:
-    model = MelToMagModel().to(device).eval()
-    model.load_state_dict(load_checkpoint_state(path, device=device), strict=strict)
+    checkpoint = torch.load(Path(path), map_location="cpu")
+    model = MelToMagModel.from_checkpoint(checkpoint, strict=strict).to(device).eval()
     return model
 
 

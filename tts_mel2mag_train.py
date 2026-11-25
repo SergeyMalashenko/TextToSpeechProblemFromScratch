@@ -14,6 +14,7 @@ from tqdm import tqdm
 import hyperparams_mel2mag as hp
 from tts_dataset import get_mel2mag_dataset, collate_fn_mel2mag
 from tts_mel2mag_model import MelToMagModel
+from tts_mel2mag_losses import MelToMagLoss
 from tts_seed import make_torch_generator, seed_worker, set_seed
 
 
@@ -98,6 +99,8 @@ def save_checkpoint(
     epoch: int,
     global_step: int,
     path: str | Path,
+    best_val_loss: float = float("inf"),
+    batch_in_epoch: int = 0,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,6 +108,11 @@ def save_checkpoint(
     torch.save(
         {
             "model": unwrap_model(model).state_dict(),
+            "model_config": unwrap_model(model).config,
+            "training_config": {key: value for key, value in vars(hp).items()
+                                if not key.startswith("_") and isinstance(value, (str, int, float, bool, list, tuple, type(None)))},
+            "best_val_loss": best_val_loss,
+            "batch_in_epoch": batch_in_epoch,
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
             "epoch": epoch,
@@ -116,11 +124,12 @@ def save_checkpoint(
 
 def cleanup_old_checkpoints(checkpoint_dir: str | Path, keep_last_n: int) -> None:
     checkpoint_dir = Path(checkpoint_dir)
-    if not checkpoint_dir.exists():
+    if keep_last_n <= 0 or not checkpoint_dir.exists():
         return
 
     checkpoints = sorted(
-        checkpoint_dir.glob("checkpoint_mel2mag_*.pth.tar"),
+        (p for p in checkpoint_dir.glob("checkpoint_mel2mag_*.pth.tar")
+         if p.name.removeprefix("checkpoint_mel2mag_").split(".")[0].isdigit()),
         key=lambda p: p.stat().st_mtime,
     )
 
@@ -149,6 +158,8 @@ def maybe_resume_from_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
 
     checkpoint = torch.load(resume_path, map_location=device)
+    if checkpoint.get("model_config") != unwrap_model(model).config:
+        raise ValueError("Resume requires matching residual model_config; legacy weights are inference-only.")
     unwrap_model(model).load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
 
@@ -169,16 +180,18 @@ def train_one_step(
     batch: Dict[str, torch.Tensor],
     device: torch.device,
     amp_device_type: str,
+    criterion: MelToMagLoss,
 ) -> Dict[str, float]:
     batch = move_batch_to_device(batch, device)
 
     with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
-        mag_pred = model(batch["mel"])
-        loss = masked_l1_loss(
-            pred=mag_pred,
-            target=batch["mag"],
-            lengths=batch["lengths"],
-        )
+        mel_input = batch["mel"]
+        noise_std = float(hp_get("mel2mag_input_noise_std", 0.0))
+        if noise_std > 0:
+            mel_input = (mel_input + torch.randn_like(mel_input) * noise_std).clamp(0, 1)
+        mag_pred = model(mel_input, batch["lengths"])
+        losses = criterion(mag_pred, batch["mag"], batch["mel"], batch["lengths"])
+        loss = losses["loss"]
 
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
@@ -187,7 +200,7 @@ def train_one_step(
     scaler.step(optimizer)
     scaler.update()
 
-    return {"loss": float(loss.item())}
+    return {key: float(value.detach().item()) for key, value in losses.items()}
 
 
 @torch.no_grad()
@@ -197,22 +210,55 @@ def validate(
     device: torch.device,
     amp_device_type: str,
 ) -> Dict[str, float]:
+    was_training = model.training
     model.eval()
     total_loss = 0.0
-    n_batches = 0
+    total_elements = 0
+    outside_elements = 0
+    try:
+        for batch in tqdm(dataloader, desc="validation", leave=False):
+            batch = move_batch_to_device(batch, device)
+            with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
+                mag_pred = model(batch["mel"], batch["lengths"])
+            # Select best by the unchanged, valid-bin L1 metric across ablations.
+            loss = masked_l1_loss(mag_pred.float(), batch["mag"], batch["lengths"])
+            count = int(batch["lengths"].sum().item()) * mag_pred.size(-1)
+            total_loss += float(loss.item()) * count
+            total_elements += count
+            valid = sequence_mask(batch["lengths"], mag_pred.size(1)).unsqueeze(-1)
+            outside_elements += int((((mag_pred < 0) | (mag_pred > 1)) & valid).sum().item())
+    finally:
+        model.train(was_training)
+    if total_elements == 0:
+        raise ValueError("Validation dataset has no valid frames")
+    return {"loss": total_loss / total_elements, "outside_range": outside_elements / total_elements}
 
-    for batch in tqdm(dataloader, desc="validation", leave=False):
-        batch = move_batch_to_device(batch, device)
-        with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
-            mag_pred = model(batch["mel"])
-            loss = masked_l1_loss(pred=mag_pred, target=batch["mag"], lengths=batch["lengths"])
-        total_loss += float(loss.item())
-        n_batches += 1
 
-    model.train()
-    if n_batches == 0:
-        return {"loss": 0.0}
-    return {"loss": total_loss / n_batches}
+@torch.no_grad()
+def save_validation_sample(model, dataloader, device, epoch):
+    import numpy as np
+    from scipy.io.wavfile import write
+    from data_pipeline import spectrogram_to_wav
+
+    was_training = model.training
+    model.eval()
+    try:
+        batch = move_batch_to_device(next(iter(dataloader)), device)
+        length = int(batch["lengths"][0].item())
+        # Always use the first validation utterance for listening comparisons.
+        mel = batch["mel"][:1, :length]
+        prediction = model(mel)[0].float().cpu().numpy()
+        target = batch["mag"][0, :length].cpu().numpy()
+        directory = Path(hp_get("sample_path", "./outputs/samples/mel2mag"))
+        directory.mkdir(parents=True, exist_ok=True)
+        prefix = directory / f"mel2mag_epoch_{epoch:04d}"
+        np.save(f"{prefix}_mel.npy", mel[0].cpu().numpy())
+        for name, magnitude in (("predicted", prediction), ("target", target)):
+            np.save(f"{prefix}_{name}.npy", magnitude)
+            wav = spectrogram_to_wav(magnitude)
+            write(f"{prefix}_{name}.wav", hp.sr, wav.astype(np.float32))
+    finally:
+        model.train(was_training)
 
 
 def main() -> None:
@@ -227,6 +273,8 @@ def main() -> None:
 
     full_dataset = get_mel2mag_dataset()
 
+    if len(full_dataset) < 2 or not 0 < get_val_ratio() < 1:
+        raise ValueError("MelToMag needs at least two examples and 0 < val_ratio < 1")
     val_size = max(1, int(len(full_dataset) * get_val_ratio()))
     train_size = len(full_dataset) - val_size
 
@@ -241,7 +289,7 @@ def main() -> None:
         batch_size=hp.batch_size,
         shuffle=True,
         collate_fn=collate_fn_mel2mag,
-        drop_last=True,
+        drop_last=False,
         num_workers=get_num_workers(),
         pin_memory=torch.cuda.is_available(),
         worker_init_fn=seed_worker,
@@ -263,6 +311,17 @@ def main() -> None:
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
+    mel_basis = None
+    mel_weight = float(hp_get("mel2mag_mel_consistency_weight", 0.1))
+    if mel_weight:
+        import librosa
+        mel_basis = torch.from_numpy(librosa.filters.mel(sr=hp.sr, n_fft=hp.n_fft, n_mels=hp.n_mels))
+    criterion = MelToMagLoss(
+        max_db=hp.max_db, ref_db=hp.ref_db, mel_basis=mel_basis, mel_weight=mel_weight,
+        temporal_weight=float(hp_get("mel2mag_temporal_weight", 0.1)),
+        frequency_weight=float(hp_get("mel2mag_frequency_weight", 0.1)),
+        spectral_weight=float(hp_get("mel2mag_spectral_convergence_weight", 0.0)),
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=hp.lr)
     scaler = torch.amp.GradScaler(amp_device_type)
     writer = SummaryWriter(log_dir=str(Path(hp_get("mel2mag_log_dir", "./logs"))))
@@ -279,17 +338,41 @@ def main() -> None:
     checkpoint_dir = Path(hp.checkpoint_path)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    best_val_loss = float("inf")
+    resume_batch = 0
+    if resume_path:
+        checkpoint = torch.load(resume_path, map_location="cpu")
+        best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+        resume_batch = int(checkpoint.get("batch_in_epoch", 0))
+
+    def evaluate_and_save(epoch, batch_in_epoch):
+        nonlocal best_val_loss
+        val_stats = validate(model, val_loader, device, amp_device_type)
+        for key, value in val_stats.items():
+            writer.add_scalar(f"val/{key}", value, global_step)
+        improved = val_stats["loss"] < best_val_loss
+        best_val_loss = min(best_val_loss, val_stats["loss"])
+        kwargs = dict(model=model, optimizer=optimizer, scaler=scaler, epoch=epoch,
+                      global_step=global_step, best_val_loss=best_val_loss,
+                      batch_in_epoch=batch_in_epoch)
+        if improved:
+            save_checkpoint(**kwargs, path=checkpoint_dir / "mel2mag_best.pth.tar")
+        save_checkpoint(**kwargs, path=checkpoint_dir / "mel2mag_last.pth.tar")
+        save_checkpoint(**kwargs, path=checkpoint_dir / f"checkpoint_mel2mag_{global_step}.pth.tar")
+        cleanup_old_checkpoints(checkpoint_dir, get_max_checkpoints_to_keep())
+
     for epoch in range(start_epoch, hp.epochs):
+        train_loader.generator.manual_seed(seed + epoch)
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
 
-        for _, batch in enumerate(pbar):
+        for batch_index, batch in enumerate(pbar):
+            if epoch == start_epoch and batch_index < resume_batch:
+                continue
             global_step += 1
 
-            if global_step < 400000:
-                current_lr = adjust_learning_rate(optimizer, global_step)
-            else:
-                current_lr = float(optimizer.param_groups[0]["lr"])
+            current_lr = adjust_learning_rate(
+                optimizer, global_step, int(hp_get("mel2mag_warmup_steps", 4000)))
 
             stats = train_one_step(
                 model=model,
@@ -298,31 +381,22 @@ def main() -> None:
                 batch=batch,
                 device=device,
                 amp_device_type=amp_device_type,
+                criterion=criterion,
             )
 
             pbar.set_postfix(loss=f"{stats['loss']:.4f}", lr=f"{current_lr:.6f}")
-            writer.add_scalar("train/loss", stats["loss"], global_step)
+            for key, value in stats.items():
+                writer.add_scalar(f"train/{key}", value, global_step)
             writer.add_scalar("train/lr", current_lr, global_step)
 
-            if global_step % get_checkpoint_every() == 0:
-                ckpt_path = checkpoint_dir / f"checkpoint_mel2mag_{global_step}.pth.tar"
-                save_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                    epoch=epoch,
-                    global_step=global_step,
-                    path=ckpt_path,
-                )
-                cleanup_old_checkpoints(checkpoint_dir, keep_last_n=get_max_checkpoints_to_keep())
+            if get_checkpoint_every() > 0 and global_step % get_checkpoint_every() == 0:
+                evaluate_and_save(epoch, batch_index + 1)
 
-                val_stats = validate(
-                    model=model,
-                    dataloader=val_loader,
-                    device=device,
-                    amp_device_type=amp_device_type,
-                )
-                writer.add_scalar("val/loss", val_stats["loss"], global_step)
+        # Epoch-end validation also preserves the final partial checkpoint interval.
+        evaluate_and_save(epoch + 1, 0)
+        sample_every = int(hp_get("mel2mag_sample_every_epoch", 5))
+        if sample_every > 0 and (epoch + 1) % sample_every == 0:
+            save_validation_sample(model, val_loader, device, epoch + 1)
 
     writer.close()
 

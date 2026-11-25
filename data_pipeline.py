@@ -125,7 +125,7 @@ def spectrogram_to_wav(mag_norm_t: np.ndarray) -> np.ndarray:
     mag_db = denormalize_db(mag_norm, ref_db=hp.ref_db, max_db=hp.max_db)
     mag_amp = np.power(10.0, mag_db * 0.05)
 
-    wav = griffin_lim(mag_amp ** hp.power, n_iter=hp.n_iter)
+    wav = griffin_lim(mag_amp ** getattr(hp, "griffinlim_power", 1.0), n_iter=hp.n_iter)
     wav = signal.lfilter([1], [1, -hp.preemphasis], wav)
     wav, _ = librosa.effects.trim(wav)
     return wav.astype(np.float32)

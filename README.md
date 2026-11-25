@@ -124,7 +124,7 @@ All three acoustic trainers print aligned epoch summaries:
 
 ```bash
 python tts_mel2mag_train.py
-tensorboard --logdir ./logs/mel2mag
+tensorboard --logdir ./outputs/logs/mel2mag
 ```
 
 ### HiFi-GAN
@@ -238,3 +238,40 @@ python tts_mamba_synthesis.py \
   Unidecode, inflect, TensorBoard, and optionally `mamba-ssm`.
 - Mamba synthesis requires a `mamba-ssm` build that provides Mamba3.
 - HiFi-GAN training uses the repository's current experimental vocoder path.
+
+## MelToMag residual model
+
+New training uses 256 channels and eight residual temporal convolutions with
+per-frame LayerNorm, dilation `[1, 2, 4, 8, 16, 1, 2, 4]`, and hidden dropout 0.1.
+The output projection has no normalization or dropout. The default sigmoid bounds
+normalized dB predictions to `[0, 1]`; `mel2mag_output_activation = "linear"`
+enables a comparison. Length masks are applied between blocks.
+
+The training loss combines valid-bin L1 with mel consistency and temporal/frequency
+difference losses. Each auxiliary weight is configurable in `hyperparams_mel2mag.py`;
+set it to zero to disable it. Linear-amplitude spectral convergence and input mel
+noise are opt-in. Mel consistency uses the same librosa mel basis and amplitude/dB
+conversion as feature preparation. Nonlinear conversions and reductions use FP32.
+
+Validation ranks checkpoints by valid-bin L1, weighted by the number of valid bins,
+and reports the fraction of predictions outside `[0, 1]`. It runs at checkpoint
+intervals and at every epoch end. `mel2mag_best.pth.tar` and `mel2mag_last.pth.tar`
+are retained independently of numbered checkpoint cleanup. Checkpoints include
+model/training configuration and the batch position for resume. Resume preserves
+data order but does not promise bitwise-identical dropout or augmentation RNG.
+Every five epochs the first validation example is saved under
+`outputs/samples/mel2mag`, with predicted/target magnitude arrays and Griffin-Lim
+WAVs. Set `mel2mag_sample_every_epoch = 0` to disable listening samples.
+
+The new architecture requires fresh training. All three acoustic synthesis scripts
+automatically recognize old convolution/BatchNorm checkpoints for inference;
+new checkpoints must include `model_config`. Legacy weights cannot resume training
+with the residual architecture.
+
+Griffin-Lim now uses `griffinlim_power = 1.0` so inversion does not sharpen the
+predicted amplitude spectrum. Set it to `1.2` in `hyperparams_base.py` to compare
+legacy reconstruction; existing feature files do not need regeneration.
+
+Run regression checks with `python -m unittest discover -s tests -v` in an environment
+with the project dependencies installed. Quality comparisons still require training
+on the same split and listening to both true-mel and predicted-mel synthesis.

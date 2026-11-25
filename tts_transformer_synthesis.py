@@ -162,9 +162,8 @@ def load_transformer_model(transformer_ckpt: str | Path, device: torch.device, s
 
 def load_mel2mag_model(mel2mag_ckpt: str | Path, device: torch.device, strict: bool = True):
     if MEL2MAG_CLASS is None: raise ImportError("MelToMag model implementation was not found.")
-    model = MEL2MAG_CLASS().to(device).eval()
-    sd = load_checkpoint_state(mel2mag_ckpt, device=device)
-    model.load_state_dict(sd, strict=strict)
+    checkpoint = torch.load(Path(mel2mag_ckpt), map_location="cpu")
+    model = MEL2MAG_CLASS.from_checkpoint(checkpoint, strict=strict).to(device).eval()
     return model
 
 def load_hifigan_generator(ckpt_path: str | Path, device: torch.device, strict: bool = True):
@@ -205,7 +204,7 @@ def spectrogram2wav(mag: np.ndarray) -> np.ndarray:
     mag = mag.T
     mag = (np.clip(mag, 0, 1) * hp.max_db) - hp.max_db + hp.ref_db
     mag = np.power(10.0, mag * 0.05)
-    wav = griffin_lim(mag ** hp.power)
+    wav = griffin_lim(mag ** getattr(hp, "griffinlim_power", 1.0))
     wav = signal.lfilter([1], [1, -hp.preemphasis], wav)
     #wav, _ = librosa.effects.trim(wav)
     return np.clip(wav, -1.0, 1.0).astype(np.float32)
