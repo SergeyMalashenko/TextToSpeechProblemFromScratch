@@ -48,8 +48,11 @@ def get_seed() -> int:
     return int(hp_get("seed", 42))
 
 
-def get_checkpoint_every() -> int:
-    return int(hp_get("save_step", 2000))
+def get_checkpoint_every_epoch() -> int:
+    interval = int(hp_get("mel2mag_save_every_epoch", 1))
+    if interval < 1:
+        raise ValueError("mel2mag_save_every_epoch must be at least 1")
+    return interval
 
 
 def get_max_checkpoints_to_keep() -> int:
@@ -128,8 +131,7 @@ def cleanup_old_checkpoints(checkpoint_dir: str | Path, keep_last_n: int) -> Non
         return
 
     checkpoints = sorted(
-        (p for p in checkpoint_dir.glob("checkpoint_mel2mag_*.pth.tar")
-         if p.name.removeprefix("checkpoint_mel2mag_").split(".")[0].isdigit()),
+        checkpoint_dir.glob("checkpoint_mel2mag_epoch_*.pth.tar"),
         key=lambda p: p.stat().st_mtime,
     )
 
@@ -262,6 +264,7 @@ def save_validation_sample(model, dataloader, device, epoch):
 
 
 def main() -> None:
+    checkpoint_every = get_checkpoint_every_epoch()
     seed = get_seed()
     set_seed(seed)
 
@@ -345,26 +348,27 @@ def main() -> None:
         best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
         resume_batch = int(checkpoint.get("batch_in_epoch", 0))
 
-    def evaluate_and_save(epoch, batch_in_epoch):
+    def evaluate_and_save(epoch):
         nonlocal best_val_loss
         val_stats = validate(model, val_loader, device, amp_device_type)
         for key, value in val_stats.items():
-            writer.add_scalar(f"val/{key}", value, global_step)
+            writer.add_scalar(f"val/{key}", value, epoch)
         improved = val_stats["loss"] < best_val_loss
         best_val_loss = min(best_val_loss, val_stats["loss"])
         kwargs = dict(model=model, optimizer=optimizer, scaler=scaler, epoch=epoch,
                       global_step=global_step, best_val_loss=best_val_loss,
-                      batch_in_epoch=batch_in_epoch)
+                      batch_in_epoch=0)
         if improved:
             save_checkpoint(**kwargs, path=checkpoint_dir / "mel2mag_best.pth.tar")
         save_checkpoint(**kwargs, path=checkpoint_dir / "mel2mag_last.pth.tar")
-        save_checkpoint(**kwargs, path=checkpoint_dir / f"checkpoint_mel2mag_{global_step}.pth.tar")
-        cleanup_old_checkpoints(checkpoint_dir, get_max_checkpoints_to_keep())
+        if epoch % checkpoint_every == 0 or epoch == int(hp.epochs):
+            save_checkpoint(**kwargs, path=checkpoint_dir / f"checkpoint_mel2mag_epoch_{epoch:04d}.pth.tar")
+            cleanup_old_checkpoints(checkpoint_dir, get_max_checkpoints_to_keep())
 
     for epoch in range(start_epoch, hp.epochs):
         train_loader.generator.manual_seed(seed + epoch)
         model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{int(hp.epochs)}")
 
         for batch_index, batch in enumerate(pbar):
             if epoch == start_epoch and batch_index < resume_batch:
@@ -389,11 +393,9 @@ def main() -> None:
                 writer.add_scalar(f"train/{key}", value, global_step)
             writer.add_scalar("train/lr", current_lr, global_step)
 
-            if get_checkpoint_every() > 0 and global_step % get_checkpoint_every() == 0:
-                evaluate_and_save(epoch, batch_index + 1)
-
-        # Epoch-end validation also preserves the final partial checkpoint interval.
-        evaluate_and_save(epoch + 1, 0)
+        # Validate and save only after a completed epoch. global_step remains
+        # the optimizer/LR counter, and old mid-epoch checkpoints can still resume.
+        evaluate_and_save(epoch + 1)
         sample_every = int(hp_get("mel2mag_sample_every_epoch", 5))
         if sample_every > 0 and (epoch + 1) % sample_every == 0:
             save_validation_sample(model, val_loader, device, epoch + 1)

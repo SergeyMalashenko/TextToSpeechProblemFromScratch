@@ -10,7 +10,8 @@ from torch import nn
 
 import hyperparams_transformer as hp
 from tts_transformer_config import build_transformer_tacotron_config, check_checkpoint_config
-from tts_transformer_synthesis import load_transformer_model, resolve_transformer_checkpoint
+from tts_transformer_synthesis import load_transformer_model, resolve_transformer_checkpoint, resolve_mel2mag_checkpoint
+import hyperparams_mel2mag as hp_mel2mag
 from tts_transformer_train import maybe_resume_from_checkpoint
 
 
@@ -53,6 +54,15 @@ class TransformerCheckpointTests(unittest.TestCase):
                     (run / "checkpoint_transformer_tacotron2_epoch_0012.pth.tar").touch()
                 with self.assertRaisesRegex(ValueError, "Several experiments"):
                     resolve_transformer_checkpoint(None)
+
+    def test_select_mel2mag_epoch_and_preserve_explicit_and_legacy_paths(self):
+        with patch.object(hp, "mel2mag_checkpoint_path", "/tmp/checkpoints"), \
+             patch.object(hp_mel2mag, "restore_mel2mag_epoch", 12):
+            self.assertEqual(resolve_mel2mag_checkpoint(None), Path("/tmp/checkpoints/checkpoint_mel2mag_epoch_0012.pth.tar"))
+            self.assertEqual(resolve_mel2mag_checkpoint("old_weights.pth.tar"), Path("old_weights.pth.tar"))
+        with patch.object(hp_mel2mag, "restore_mel2mag_epoch", None), \
+             patch.object(hp, "restore_step2", 2000, create=True):
+            self.assertEqual(resolve_mel2mag_checkpoint(None).name, "checkpoint_mel2mag_2000.pth.tar")
 
     def test_load_prefixed_and_unprefixed_weights(self):
         reference = nn.Linear(2, 2)

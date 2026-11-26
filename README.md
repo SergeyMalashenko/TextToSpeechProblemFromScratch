@@ -176,7 +176,7 @@ python tts_rnn_synthesis.py \
   --backend griffinlim \
   --text "Hello world" \
   --tacotron_ckpt ./outputs/checkpoints/rnn/checkpoint_rnn_tacotron2_epoch_0100.pth.tar \
-  --mel2mag_ckpt ./outputs/checkpoints/mel2mag/checkpoint_mel2mag_50000.pth.tar
+  --mel2mag_ckpt ./outputs/checkpoints/mel2mag/checkpoint_mel2mag_epoch_0100.pth.tar
 ```
 
 ### Transformer Tacotron
@@ -198,7 +198,7 @@ python tts_mamba_synthesis.py \
   --backend griffinlim \
   --text "Hello world" \
   --mamba_ckpt ./outputs/checkpoints/mamba/checkpoint_mamba_tacotron2_epoch_0100.pth.tar \
-  --mel2mag_ckpt ./outputs/checkpoints/mel2mag/checkpoint_mel2mag_50000.pth.tar
+  --mel2mag_ckpt ./outputs/checkpoints/mel2mag/checkpoint_mel2mag_epoch_0100.pth.tar
 ```
 
 License-plate spelling example:
@@ -256,11 +256,19 @@ noise are opt-in. Mel consistency uses the same librosa mel basis and amplitude/
 conversion as feature preparation. Nonlinear conversions and reductions use FP32.
 
 Validation ranks checkpoints by valid-bin L1, weighted by the number of valid bins,
-and reports the fraction of predictions outside `[0, 1]`. It runs at checkpoint
-intervals and at every epoch end. `mel2mag_best.pth.tar` and `mel2mag_last.pth.tar`
+and reports the fraction of predictions outside `[0, 1]`. It runs at every epoch end. Numbered checkpoints are saved every
+`mel2mag_save_every_epoch` completed epochs (default 1), and always at the final
+epoch, as `checkpoint_mel2mag_epoch_0001.pth.tar`. `mel2mag_best.pth.tar` and `mel2mag_last.pth.tar`
 are retained independently of numbered checkpoint cleanup. Checkpoints include
 model/training configuration and the batch position for resume. Resume preserves
 data order but does not promise bitwise-identical dropout or augmentation RNG.
+New checkpoints store the number of completed epochs; `global_step` is retained
+only for optimizer/LR bookkeeping and per-step training logs. Validation logs use
+epoch numbers. Set `restore_mel2mag_epoch` in `hyperparams_mel2mag.py` to select an
+epoch for synthesis, or pass any checkpoint directly with `--mel2mag_ckpt`.
+Older step-named files are still loadable by explicit path; old `restore_step2`
+settings are accepted as a fallback. Checkpoint cleanup only removes epoch-named
+files and leaves older step-named files untouched.
 Every five epochs the first validation example is saved under
 `outputs/samples/mel2mag`, with predicted/target magnitude arrays and Griffin-Lim
 WAVs. Set `mel2mag_sample_every_epoch = 0` to disable listening samples.

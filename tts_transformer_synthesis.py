@@ -21,6 +21,7 @@ from scipy import signal
 from scipy.io.wavfile import write
 
 import hyperparams_transformer as hp
+import hyperparams_mel2mag as hp_mel2mag
 import hyperparams_hifigan as hp_hifigan
 import hyperparams_diffusion_vocoder as hp_diffusion
 from text import text_to_sequence
@@ -152,10 +153,18 @@ def resolve_transformer_checkpoint(arg_value: str | None) -> Path:
     raise ValueError("Several experiments contain this epoch. Select one with --transformer_ckpt.")
 
 def resolve_mel2mag_checkpoint(arg_value: str | None) -> Path:
-    if arg_value: return Path(arg_value)
-    step = hp_get("restore_step2", None)
-    if step is None: raise ValueError("Mel2Mag checkpoint is not provided. Use --mel2mag_ckpt.")
-    return Path(hp_get("mel2mag_checkpoint_path", "./outputs/checkpoints/mel2mag")) / f"checkpoint_mel2mag_{step}.pth.tar"
+    if arg_value:
+        return Path(arg_value)
+    epoch = getattr(hp, "restore_mel2mag_epoch", hp_mel2mag.restore_mel2mag_epoch)
+    checkpoint_dir = Path(getattr(hp, "mel2mag_checkpoint_path", hp_mel2mag.mel2mag_checkpoint_path))
+    if epoch is not None:
+        return checkpoint_dir / f"checkpoint_mel2mag_epoch_{int(epoch):04d}.pth.tar"
+    # Older step-based checkpoint files remain usable.
+    step = getattr(hp, "restore_step2", getattr(hp_mel2mag, "restore_step2", None))
+    if step is not None:
+        return checkpoint_dir / f"checkpoint_mel2mag_{step}.pth.tar"
+    raise ValueError("Set restore_mel2mag_epoch or pass --mel2mag_ckpt.")
+
 
 def resolve_hifigan_checkpoint(arg_value: str | None) -> Path:
     if arg_value: return Path(arg_value)
