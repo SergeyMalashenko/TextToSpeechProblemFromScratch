@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import hyperparams_transformer as hp
+from tts_transformer_sampling import mix_decoder_inputs
 
 
 def hp_get(name: str, default):
@@ -150,7 +151,7 @@ class Prenet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for linear in self.layers:
-            x = F.dropout(F.relu(linear(x)), p=0.5, training=True)
+            x = F.dropout(F.relu(linear(x)), p=0.5, training=not getattr(self, "frozen", False))
         return x
 
 
@@ -456,7 +457,8 @@ class TransformerDecoderLayerWithAttention(nn.Module):
         tgt_mask: Optional[torch.Tensor],
         tgt_key_padding_mask: Optional[torch.Tensor],
         memory_key_padding_mask: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        need_attention: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = tgt
         x = self.norm1(tgt)
         x = self.self_attn(
@@ -471,7 +473,7 @@ class TransformerDecoderLayerWithAttention(nn.Module):
         x, cross_attn_weights = self.cross_attn(
             x, memory, memory,
             key_padding_mask=memory_key_padding_mask,
-            need_weights=True,
+            need_weights=need_attention,
             average_attn_weights=False,
         )
         tgt = residual + self.cross_attn_scale(self.dropout(x))
@@ -510,7 +512,7 @@ class TransformerDecoder(nn.Module):
         return decoder_inputs
 
     def decode(self, decoder_inputs: torch.Tensor, memory: torch.Tensor, text_lengths: torch.Tensor,
-               output_lengths: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+               output_lengths: Optional[torch.Tensor] = None, mel_only: bool = False):
         x = self.parse_decoder_inputs(decoder_inputs)
         x = self.prenet(x)
         x = self.prenet_proj(x)
@@ -532,9 +534,12 @@ class TransformerDecoder(nn.Module):
                 tgt_mask=tgt_mask,
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
+                need_attention=not mel_only,
             )
 
         mel_outputs = self.mel_projection(x)
+        if mel_only:
+            return mel_outputs
         gate_outputs = self.gate_projection(x).squeeze(-1)
         alignments = cross_attn_last.mean(dim=1)
 
@@ -545,8 +550,8 @@ class TransformerDecoder(nn.Module):
         )
 
     def forward(self, memory: torch.Tensor, mel_input: torch.Tensor, text_lengths: torch.Tensor,
-                output_lengths: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.decode(mel_input, memory, text_lengths, output_lengths)
+                output_lengths: Optional[torch.Tensor] = None, mel_only: bool = False):
+        return self.decode(mel_input, memory, text_lengths, output_lengths, mel_only)
 
     @torch.no_grad()
     def inference(self, memory: torch.Tensor, text_lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -606,24 +611,52 @@ class TransformerTacotron2(nn.Module):
         self.postnet = Postnet()
 
     def forward(self, text: torch.Tensor, text_lengths: torch.Tensor, mel_input: torch.Tensor,
-                output_lengths: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                output_lengths: Optional[torch.Tensor] = None, teacher_forcing_ratio: float = 1.0,
+                apply_scheduled_sampling: bool = False,
+                return_sampling_stats: bool = False) -> Dict[str, torch.Tensor]:
+        if not 0 <= teacher_forcing_ratio <= 1:
+            raise ValueError("teacher_forcing_ratio must be in [0, 1]")
         embedded = self.embedding(text)
+        # Outside no_grad: the second pass must train the encoder as well.
         memory = self.encoder(embedded, text_lengths)
+        decoder_input = mel_input
+        use_sampling = teacher_forcing_ratio < 1.0 and (self.training or apply_scheduled_sampling)
+        if use_sampling:
+            if output_lengths is None:
+                raise ValueError("Scheduled sampling requires output_lengths")
+            # Same decoder and masks; no PostNet and no loss in the preliminary pass.
+            # The decoder contains LayerNorm/dropout, but no BatchNorm statistics.
+            with torch.no_grad():
+                first_mel = self.decoder(
+                    memory=memory, mel_input=mel_input, text_lengths=text_lengths,
+                    output_lengths=output_lengths, mel_only=True,
+                )
+                decoder_input, teacher_frames, valid_frames = mix_decoder_inputs(
+                    mel_input, first_mel, output_lengths, teacher_forcing_ratio,
+                )
 
         mel_before, gate, alignments = self.decoder(
             memory=memory,
-            mel_input=mel_input,
+            mel_input=decoder_input,
             text_lengths=text_lengths,
             output_lengths=output_lengths,
         )
         mel_after = mel_before + self.postnet(mel_before)
-
-        return {
+        outputs = {
             "mel_before": mel_before,
             "mel_after": mel_after,
             "gate": gate,
             "alignments": alignments,
         }
+        if return_sampling_stats:
+            if not use_sampling:
+                lengths = output_lengths if output_lengths is not None else mel_input.new_full(
+                    (mel_input.size(0),), mel_input.size(1), dtype=torch.long)
+                valid_frames = (lengths - 1).clamp_min(0)
+                teacher_frames = valid_frames
+            outputs["sampling_teacher_frames"] = teacher_frames
+            outputs["sampling_valid_frames"] = valid_frames
+        return outputs
 
     @torch.no_grad()
     def inference(self, text: torch.Tensor, text_lengths: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:

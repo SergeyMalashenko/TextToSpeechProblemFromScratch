@@ -130,3 +130,27 @@ transformer_log_dir = "./outputs/logs/transformer"
 sample_path = "./outputs/samples/transformer"
 synthesis_path = "./outputs/synthesis/transformer"
 log_dir = "./outputs/logs/transformer"
+
+# =============================================================================
+# Optional two-pass scheduled sampling. Baseline behavior is unchanged by default.
+# =============================================================================
+scheduled_sampling = {
+    "enabled": False,
+    "method": "two_pass",
+    "detach_predictions": True,
+    "sampling_granularity": "frame",
+    "prediction_source": "mel_before_postnet",
+    "validation_enabled": False,
+    "scheduler": {
+        "type": "piecewise_linear", "unit": "epoch",
+        "points": [[0, 1.0], [5, 1.0], [15, 0.9], [35, 0.5], [60, 0.2]],
+    },
+}
+
+# Decoder is the core stack, excluding the separately named prenet and heads.
+freeze = {name: False for name in (
+    "text_embedding", "encoder", "decoder_prenet", "decoder",
+    "mel_projection", "gate_projection", "postnet",
+)}
+lr_multipliers = {name: 1.0 for name in freeze}
+resume_weights_only = False  # start a new stage; reset optimizer, counters and schedules

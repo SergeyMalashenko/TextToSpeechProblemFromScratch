@@ -288,7 +288,8 @@ on the same split and listening to both true-mel and predicted-mel synthesis.
 
 ## Transformer teaching workflow
 
-The Transformer architecture and straightforward training loop are unchanged.
+With scheduled sampling disabled, the Transformer architecture and teacher-forcing
+forward path remain unchanged.
 Correctness checks are kept in the existing scripts:
 
 - Mel L1 and guided-attention reductions use FP32 to avoid FP16 overflow under AMP.
@@ -326,3 +327,174 @@ subdirectory; if multiple runs match, pass `--transformer_ckpt` explicitly.
 There is no KV cache, profiler, or additional training framework. Run the small
 regression examples with `python -m unittest discover -s tests -v` after installing
 the project dependencies.
+
+## Two-pass scheduled sampling for Transformer
+
+This implements a mel-frame adaptation of the shared-decoder, stopped-gradient
+variant of [Mihaylova and Martins (2019)](https://arxiv.org/abs/1906.07651).
+It is an experimental training option; improved speech quality is not guaranteed.
+No sequential autoregressive training loop or new third-party dependency is used.
+
+### Forward path
+
+`TransformerTacotron2.forward` still accepts the existing shifted `mel_input` and
+`output_lengths`. New optional arguments default to ordinary teacher forcing:
+
+```python
+outputs = model(text, text_lengths, mel_input, output_lengths,
+                teacher_forcing_ratio=0.5, return_sampling_stats=True)
+```
+
+The encoder runs once with its graph intact. When training with ratio below 1,
+the same decoder first predicts `mel_before` under `torch.no_grad()`, without gate
+projection, attention-weight collection or PostNet. Shifted, detached predictions
+replace entire input frames using a `(B, T, 1)` Bernoulli mask. Input position `t`
+receives prediction `t-1`; GO and padding positions retain their original values.
+The second pass uses the same encoder memory and causal/text/mel padding masks.
+PostNet and all existing losses, including guided attention, use the second pass.
+The decoder has no BatchNorm; PostNet BatchNorm updates only once per training
+forward. `no_grad()` never changes train/eval mode or parameter trainability.
+
+Disabled SS and ratio 1 use one decoder pass. Ratio 0 replaces all eligible
+frames, but is still an approximation: first-pass predictions were teacher-forced.
+The existing `inference()` algorithm and model state-dict keys are unchanged.
+
+### Configuration and schedules
+
+`hyperparams_transformer.py` contains the default baseline:
+
+```python
+scheduled_sampling = {"enabled": False}
+freeze = {name: False for name in (
+    "text_embedding", "encoder", "decoder_prenet", "decoder",
+    "mel_projection", "gate_projection", "postnet",
+)}
+lr_multipliers = {name: 1.0 for name in freeze}
+```
+
+The complete shared fine-tuning configuration is
+[`configs/transformer_finetune.json`](configs/transformer_finetune.json). It uses
+AdamW, base LR `3.75e-5`, five warmup epochs, and this schedule:
+
+```json
+{
+  "enabled": true,
+  "method": "two_pass",
+  "detach_predictions": true,
+  "sampling_granularity": "frame",
+  "prediction_source": "mel_before_postnet",
+  "validation_enabled": true,
+  "scheduler": {
+    "type": "piecewise_linear",
+    "unit": "epoch",
+    "points": [[0, 1.0], [5, 1.0], [15, 0.9], [35, 0.5], [60, 0.2]]
+  }
+}
+```
+
+Coordinates are zero-based and relative to the start of the new stage. With 60
+training epochs the last coordinate is 59; use 61 epochs to train at coordinate 60.
+Schedules support `unit: "epoch"` or `"step"` (completed training-batch count):
+
+| Type | Additional scheduler fields | Behavior |
+| --- | --- | --- |
+| `constant` | `value` | Fixed ratio |
+| `linear` | `start`, `end`, `duration` | Linear interpolation, then hold `end` |
+| `exponential` | `start`, `end`, `decay_rate` | `end + (start-end) * decay_rate**position` |
+| `inverse_sigmoid` | `start`, `end`, `k` | `end + (start-end)*(k+1)/(k+exp(position/k))` |
+| `piecewise_linear` | `points` | Interpolate points; hold final value afterwards |
+
+The inverse sigmoid is normalized to begin at `start`. By default, nonconstant
+schedules use `start=1`, `end=0.2`; see the helper for other defaults.
+
+Components are independent: `decoder_prenet` includes its input projection;
+`decoder` means the positional encoding and decoder layers, excluding the prenet
+and mel/gate heads. Freezing the encoder alone still permits gradients to flow
+through it to a trainable embedding. Frozen parameters are excluded from AdamW;
+frozen blocks run in eval mode (including frozen prenet's normally active dropout).
+Frozen PostNet BatchNorm buffers do not update. LR groups cover every trainable
+parameter once; epoch LR scheduling preserves each group's multiplier.
+
+### Commands and ablations
+
+Prepare the same data/features as for normal Transformer training. A fresh baseline
+still runs with the existing command:
+
+```bash
+python tts_transformer_train.py
+```
+
+For controlled fine-tuning comparisons, start every experiment from the same
+checkpoint and shared JSON configuration. Replace this example checkpoint path:
+
+```bash
+BASE_CKPT=./outputs/checkpoints/transformer/transformer_RUN/transformer_best.pth.tar
+
+python tts_transformer_experiment.py --config configs/transformer_finetune.json \
+  --experiment baseline --checkpoint "$BASE_CKPT" --weights-only
+
+python tts_transformer_experiment.py --config configs/transformer_finetune.json \
+  --experiment ss2 --checkpoint "$BASE_CKPT" --weights-only
+```
+
+| Preset | SS | Encoder | Embedding/encoder LR multipliers |
+| --- | --- | --- | --- |
+| `baseline` | Off | Trainable | 1 / 1 |
+| `ss1` | On | Trainable | 1 / 1 |
+| `ss2` | On | Trainable | 0.1 / 0.1 |
+| `ss3` | On | Frozen | 1 / excluded |
+
+Use `--experiment ss1` or `ss3` with the same command for the other ablations.
+Presets reset freezing/multipliers; omit `--experiment` to use custom JSON values
+verbatim. JSON is applied before importing the model, whose existing constants
+are read at import time. Run each experiment in its own Python process.
+
+`--weights-only` starts a new stage at epoch/step zero with a fresh optimizer and
+relative TF schedule; it is the default when passing `--checkpoint`. Old
+single-group AdamW checkpoints require this mode when moving to component groups.
+No optimizer state is silently discarded in full-resume mode. Architecture and
+model weight keys remain compatible with older checkpoints.
+
+To continue the same stage with its optimizer, TF schedule, split, best score and
+RNG states, use the same configuration/preset and its last checkpoint:
+
+```bash
+python tts_transformer_experiment.py --config configs/transformer_finetune.json \
+  --experiment ss2 --checkpoint ./outputs/checkpoints/transformer/transformer_SS2_RUN/transformer_last.pth.tar \
+  --resume --epochs 90
+```
+
+`--epochs` is the total length of this stage, including completed epochs on resume.
+Changes to freeze settings, LR multipliers or TF schedule require a new stage.
+Saved split indices and a metadata fingerprint are checked on resume. Exact
+cross-hardware or cross-version numerical reproducibility is not guaranteed.
+
+### Validation, logs and tests
+
+Teacher-forced validation remains the checkpoint selection metric and is also
+logged as `val/teacher_forced_loss`. Optional `val/scheduled_sampling_loss` uses
+an independently seeded mask in eval mode, without changing the teacher-forced
+metric or consuming its training RNG stream. Ratio 1 reuses the TF result.
+Autoregressive validation and synthesis never use target mel or two-pass sampling.
+Use the existing synthesis script and the same text/vocoder for listening comparisons.
+
+New epoch logs include requested/effective TF ratios, replacement ratio,
+`postnet_loss` (an alias of existing `mel_after_loss`), `guided_attention_loss`,
+`lr_<component>` and `grad_norm_<component>` (zero for frozen components). Gradient norms
+are measured after AMP unscaling and before clipping. Effective ratios count only
+eligible frames, excluding GO and padding; their epoch aggregate is frame-weighted.
+Existing attention metrics remain; validation also provides `attention_coverage`,
+`attention_backward`, and `attention_ar_len` aliases for the autoregressive checks.
+Training attention visualizations use second-pass alignments.
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Tests cover ratios 0/1, frame-wise masking, shifts, GO/padding, detached first-pass
+predictions, shared decoder/memory, encoder/decoder gradients, frozen parameters
+and buffers, optimizer coverage, LR multipliers, all five TF schedules, CPU AMP,
+causal attention in both positional modes, separated validation, legacy weights,
+unchanged inference, and save/resume of the actual trainer. A CUDA FP16 test runs
+when a GPU is available. Quality and robustness still require real training and
+listening; two-pass validation is not a substitute for autoregressive evaluation.

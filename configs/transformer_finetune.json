@@ -1,0 +1,45 @@
+{
+  "epochs": 60,
+  "batch_size": 48,
+  "seed": 42,
+  "lr_warmup_epochs": 5,
+  "val_every_epoch": 1,
+  "image_every_epoch": 5,
+  "sample_every_epoch": 5,
+  "checkpoint_every_epoch": 5,
+  "optimizer": {
+    "name": "adamw",
+    "learning_rate": 0.0000375,
+    "lr_multipliers": {
+      "text_embedding": 1.0,
+      "encoder": 1.0,
+      "decoder_prenet": 1.0,
+      "decoder": 1.0,
+      "mel_projection": 1.0,
+      "gate_projection": 1.0,
+      "postnet": 1.0
+    }
+  },
+  "freeze": {
+    "text_embedding": false,
+    "encoder": false,
+    "decoder_prenet": false,
+    "decoder": false,
+    "mel_projection": false,
+    "gate_projection": false,
+    "postnet": false
+  },
+  "scheduled_sampling": {
+    "enabled": true,
+    "method": "two_pass",
+    "detach_predictions": true,
+    "sampling_granularity": "frame",
+    "prediction_source": "mel_before_postnet",
+    "validation_enabled": true,
+    "scheduler": {
+      "type": "piecewise_linear",
+      "unit": "epoch",
+      "points": [[0, 1.0], [5, 1.0], [15, 0.9], [35, 0.5], [60, 0.2]]
+    }
+  }
+}

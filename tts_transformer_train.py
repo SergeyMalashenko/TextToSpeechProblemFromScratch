@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import math
+import copy
+import hashlib
 import json
 from dataclasses import asdict
 from collections import defaultdict
@@ -14,7 +16,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 from tqdm import tqdm
 
 import hyperparams_transformer as hp
@@ -28,6 +30,10 @@ from tts_transformer_model import TransformerTacotron2
 from tts_transformer_config import build_transformer_tacotron_config, check_checkpoint_config
 from tts_tacotron_losses import Tacotron2Loss, sequence_mask
 from tts_seed import make_torch_generator, seed_worker, set_seed
+from tts_transformer_sampling import (
+    COMPONENTS, TeacherForcingScheduler, build_optimizer_groups, optimizer_group_layout,
+    set_frozen_eval, component_gradient_norms, capture_rng_state, restore_rng_state,
+)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -174,7 +180,7 @@ def get_lr_by_epoch(epoch: int) -> float:
 
 def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for group in optimizer.param_groups:
-        group["lr"] = float(lr)
+        group["lr"] = float(lr) * float(group.get("lr_multiplier", 1.0))
 
 
 def get_clip_grad_norm() -> float:
@@ -345,7 +351,7 @@ def set_guided_attn_weight(criterion: Tacotron2Loss, weight: float) -> None:
     criterion.guided_attn_weight = float(weight)
 
 
-def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler, epoch: int, global_step: int, path: str | Path) -> None:
+def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler, epoch: int, global_step: int, path: str | Path, training_state: Optional[dict] = None) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -355,6 +361,9 @@ def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, scaler: 
         "epoch": epoch,
         "global_step": global_step,
         "model_config": asdict(build_transformer_tacotron_config()),
+        "optimizer_groups": optimizer_group_layout(optimizer),
+        "training_state": training_state or {},
+        "rng_state": capture_rng_state(),
     }, path)
 
 
@@ -375,7 +384,9 @@ def cleanup_old_checkpoints(checkpoint_dir: str | Path, keep_last_n: int) -> Non
             pass
 
 
-def maybe_resume_from_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler, resume_path: Optional[str | Path], device: torch.device) -> tuple[int, int]:
+def maybe_resume_from_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler, resume_path: Optional[str | Path], device: torch.device,
+                                 sampling_scheduler=None, weights_only: bool = False,
+                                 freeze_config: Optional[dict] = None) -> tuple[int, int]:
     if not resume_path:
         return 0, 0
     resume_path = Path(resume_path)
@@ -384,11 +395,36 @@ def maybe_resume_from_checkpoint(model: nn.Module, optimizer: torch.optim.Optimi
 
     checkpoint = torch.load(resume_path, map_location=device)
     check_checkpoint_config(checkpoint.get("model_config"))
-    consume_prefix_in_state_dict_if_present(checkpoint["model"], "module.")
-    unwrap_model(model).load_state_dict(checkpoint["model"])
+    model_state = checkpoint.get("model", checkpoint)
+    consume_prefix_in_state_dict_if_present(model_state, "module.")
+    unwrap_model(model).load_state_dict(model_state)
+    if weights_only:
+        print(f"Loaded model weights for a new training stage: {resume_path}")
+        return 0, 0
+    if "optimizer" not in checkpoint:
+        raise ValueError("Checkpoint has no optimizer state; use --weights-only")
+    old_groups = checkpoint["optimizer"]["param_groups"]
+    same_sizes = len(old_groups) == len(optimizer.param_groups) and all(
+        len(old["params"]) == len(new["params"])
+        for old, new in zip(old_groups, optimizer.param_groups)
+    )
+    if not same_sizes or ("optimizer_groups" in checkpoint and
+                          checkpoint["optimizer_groups"] != optimizer_group_layout(optimizer)):
+        raise ValueError("Optimizer groups differ from checkpoint; use resume_weights_only=True or --weights-only")
+    state = checkpoint.get("training_state", {})
+    if freeze_config is not None and "freeze" in state and state["freeze"] != freeze_config:
+        raise ValueError("Freeze configuration differs from checkpoint; use --weights-only")
+    if sampling_scheduler is not None:
+        saved_scheduler = state.get("sampling_scheduler")
+        if saved_scheduler is not None:
+            sampling_scheduler.load_state_dict(saved_scheduler)
+        elif sampling_scheduler.config.get("enabled", False):
+            raise ValueError("Checkpoint has no TF scheduler state; use --weights-only for a new stage")
     optimizer.load_state_dict(checkpoint["optimizer"])
-    if "scaler" in checkpoint:
+    if checkpoint.get("scaler"):
         scaler.load_state_dict(checkpoint["scaler"])
+    if "rng_state" in checkpoint:
+        restore_rng_state(checkpoint["rng_state"])
 
     start_epoch = int(checkpoint.get("epoch", 0))
     global_step = int(checkpoint.get("global_step", 0))
@@ -424,9 +460,11 @@ def save_validation_sample(model: nn.Module, dataset, device: torch.device, save
     torch.save(outputs["alignments"][0].detach().cpu(), save_dir / f"transformer_sample_align_epoch_{epoch:04d}.pt")
 
 
-def train_one_step(model: nn.Module, criterion: Tacotron2Loss, optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler, batch: Dict[str, torch.Tensor], device: torch.device, amp_device_type: str, guided_attn_weight: float) -> tuple[Dict[str, torch.Tensor], Dict[str, float]]:
+def train_one_step(model: nn.Module, criterion: Tacotron2Loss, optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler, batch: Dict[str, torch.Tensor], device: torch.device, amp_device_type: str, guided_attn_weight: float,
+                   teacher_forcing_ratio: float = 1.0, freeze_config: Optional[dict] = None) -> tuple[Dict[str, torch.Tensor], Dict[str, float]]:
     batch = move_batch_to_device(batch, device)
     set_guided_attn_weight(criterion, guided_attn_weight)
+    set_frozen_eval(unwrap_model(model), freeze_config or {})
 
     with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
         outputs = model(
@@ -434,6 +472,8 @@ def train_one_step(model: nn.Module, criterion: Tacotron2Loss, optimizer: torch.
             text_lengths=batch["text_lengths"],
             mel_input=batch["mel_input"],
             output_lengths=batch["output_lengths"],
+            teacher_forcing_ratio=teacher_forcing_ratio,
+            return_sampling_stats=True,
         )
         losses = criterion(outputs=outputs, batch=batch)
 
@@ -446,6 +486,7 @@ def train_one_step(model: nn.Module, criterion: Tacotron2Loss, optimizer: torch.
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(losses["loss"]).backward()
     scaler.unscale_(optimizer)
+    gradient_norms = component_gradient_norms(unwrap_model(model))
     nn.utils.clip_grad_norm_(model.parameters(), get_clip_grad_norm())
     scaler.step(optimizer)
     scaler.update()
@@ -459,6 +500,24 @@ def train_one_step(model: nn.Module, criterion: Tacotron2Loss, optimizer: torch.
         "mel_after_loss": float(losses["mel_after_loss"].item()),
         "guided_attn_weight": float(guided_attn_weight),
     }
+    valid_frames = int(outputs["sampling_valid_frames"].sum().item())
+    teacher_frames = int(outputs["sampling_teacher_frames"].sum().item())
+    effective_ratio = teacher_frames / valid_frames if valid_frames else 1.0
+    metrics.update({
+        "teacher_forcing_ratio": float(teacher_forcing_ratio),
+        "effective_teacher_forcing_ratio": effective_ratio,
+        "replaced_frames_ratio": 1.0 - effective_ratio,
+        "_sampling_teacher_frames": float(teacher_frames),
+        "_sampling_valid_frames": float(valid_frames),
+        "postnet_loss": metrics["mel_after_loss"],
+        "guided_attention_loss": metrics["attn_loss"],
+        **gradient_norms,
+    })
+    for name in COMPONENTS:
+        metrics[f"lr_{name}"] = 0.0  # frozen components have no optimizer group
+    for group in optimizer.param_groups:
+        if "name" in group:
+            metrics[f"lr_{group['name']}"] = float(group["lr"])
     metrics.update(compute_gate_metrics(outputs["gate"].detach(), batch["gate_target"], batch["output_lengths"]))
     metrics.update(compute_attention_metrics(outputs["alignments"].detach(), batch["text_lengths"], batch["output_lengths"]))
     metrics.update(compute_mel_metrics(outputs["mel_before"].detach(), outputs["mel_after"].detach(), batch["mel_target"], batch["output_lengths"]))
@@ -531,7 +590,8 @@ def compute_autoregressive_metrics(
 
 
 @torch.no_grad()
-def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader, device: torch.device, amp_device_type: str, guided_attn_weight: float) -> Dict[str, float]:
+def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader, device: torch.device, amp_device_type: str, guided_attn_weight: float,
+             teacher_forcing_ratio: float = 1.0, sampling_validation: bool = False) -> Dict[str, float]:
     model.eval()
     set_guided_attn_weight(criterion, guided_attn_weight)
     totals = defaultdict(float)
@@ -539,8 +599,9 @@ def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader,
     total_frames = 0
     mel_loss_sums = defaultdict(float)
     autoregressive_batches = []
+    sampling_loss_totals = defaultdict(float)
 
-    for batch in tqdm(dataloader, desc="validation", leave=False):
+    for batch_index, batch in enumerate(tqdm(dataloader, desc="validation", leave=False)):
         batch = move_batch_to_device(batch, device)
         for index in range(batch["text"].size(0)):
             if len(autoregressive_batches) >= int(hp_get("autoregressive_val_samples", 4)):
@@ -557,6 +618,28 @@ def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader,
                 output_lengths=batch["output_lengths"],
             )
             losses = criterion(outputs=outputs, batch=batch)
+
+        if sampling_validation:
+            if teacher_forcing_ratio == 1.0:
+                sampled_losses = losses  # identical one-pass TF, including prenet dropout
+            else:
+                devices = list(range(torch.cuda.device_count())) if device.type == "cuda" else []
+                with torch.random.fork_rng(devices=devices):
+                    torch.random.default_generator.manual_seed(get_seed() + batch_index)
+                    if devices:
+                        torch.cuda.manual_seed_all(get_seed() + batch_index)
+                    with torch.amp.autocast(amp_device_type, enabled=torch.cuda.is_available()):
+                        sampled_outputs = model(
+                            text=batch["text"], text_lengths=batch["text_lengths"],
+                            mel_input=batch["mel_input"], output_lengths=batch["output_lengths"],
+                            teacher_forcing_ratio=teacher_forcing_ratio, apply_scheduled_sampling=True,
+                        )
+                        sampled_losses = criterion(outputs=sampled_outputs, batch=batch)
+                check_finite_tensor("val/scheduled_sampling_loss", sampled_losses["loss"])
+            frames = int(batch["output_lengths"].sum().item())
+            for key in ("mel_loss", "gate_loss", "attn_loss"):
+                weight = frames if key == "mel_loss" else 1
+                sampling_loss_totals[key] += float(sampled_losses[key].item()) * weight
 
         check_finite_tensor("val/mel_before", outputs["mel_before"])
         check_finite_tensor("val/mel_after", outputs["mel_after"])
@@ -596,6 +679,15 @@ def validate(model: nn.Module, criterion: Tacotron2Loss, dataloader: DataLoader,
         metrics.update(average_metric_dict([
             compute_autoregressive_metrics(model, batch, device) for batch in autoregressive_batches
         ]))
+    metrics["teacher_forced_loss"] = metrics["loss"]
+    if sampling_validation:
+        metrics["scheduled_sampling_loss"] = (sampling_loss_totals["mel_loss"] / max(1, total_frames)
+            + sampling_loss_totals["gate_loss"] / n_batches
+            + guided_attn_weight * sampling_loss_totals["attn_loss"] / n_batches)
+    if "ar_text_coverage" in metrics:
+        metrics["attention_coverage"] = metrics["ar_text_coverage"]
+        metrics["attention_backward"] = metrics["ar_backward_jump_rate"]
+        metrics["attention_ar_len"] = metrics["ar_length_ratio"]
     model.train()
     return metrics
 
@@ -610,17 +702,36 @@ def main() -> None:
     print(f"Using device: {device}")
     print(f"AMP device type: {amp_device_type}")
 
+    sampling_config = copy.deepcopy(hp_get("scheduled_sampling", {"enabled": False}))
+    sampling_scheduler = TeacherForcingScheduler(sampling_config)
+    freeze_config = copy.deepcopy(hp_get("freeze", {}))
+    weights_only = bool(hp_get("resume_weights_only", False))
+    resume_path = hp_get("resume_transformer_tacotron_path", None)
+    saved_checkpoint = torch.load(resume_path, map_location="cpu") if resume_path else {}
+    previous_state = saved_checkpoint.get("training_state", {}) if not weights_only else {}
+
     full_dataset = get_tacotron_dataset()
+    dataset_fingerprint = None
+    if hasattr(full_dataset, "df"):
+        dataset_fingerprint = hashlib.sha256(full_dataset.df.to_csv(index=False).encode()).hexdigest()
     if len(full_dataset) < 2 or not 0 < get_val_ratio() < 1:
         raise ValueError("Training needs at least two examples and 0 < val_ratio < 1")
     val_size = max(1, int(len(full_dataset) * get_val_ratio()))
     train_size = len(full_dataset) - val_size
 
-    train_dataset, val_dataset = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=make_torch_generator(seed),
-    )
+    if "split" in previous_state:
+        split = previous_state["split"]
+        indices = split["train"] + split["val"]
+        if sorted(indices) != list(range(len(full_dataset))) or not split["train"] or not split["val"]:
+            raise ValueError("Saved split does not match the dataset; use --weights-only for a new stage")
+        if previous_state.get("dataset_fingerprint") != dataset_fingerprint:
+            raise ValueError("Dataset metadata differs from checkpoint")
+        train_dataset = Subset(full_dataset, split["train"])
+        val_dataset = Subset(full_dataset, split["val"])
+    else:
+        train_dataset, val_dataset = random_split(
+            full_dataset, [train_size, val_size], generator=make_torch_generator(seed),
+        )
     
     use_bucket_sampler = bool(getattr(hp, "use_bucket_sampler", True))
 
@@ -640,6 +751,7 @@ def main() -> None:
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=batch_sampler,
+            generator=make_torch_generator(seed),
             num_workers=hp.num_workers,
             pin_memory=torch.cuda.is_available(),
             collate_fn=collate_fn_tacotron,
@@ -674,8 +786,10 @@ def main() -> None:
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
+    parameter_groups = build_optimizer_groups(
+        unwrap_model(model), float(hp.lr), freeze_config, hp_get("lr_multipliers", {}))
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        parameter_groups,
         lr=float(hp.lr),
         betas=(float(hp_get("adam_beta1", 0.9)), float(hp_get("adam_beta2", 0.98))),
         eps=float(hp_get("adam_eps", 1e-9)),
@@ -697,12 +811,14 @@ def main() -> None:
     sample_dir = get_samples_dir() / log_dir.name
     sample_dir.mkdir(parents=True, exist_ok=True)
     config = {key: value for key, value in vars(hp).items()
-              if not key.startswith("_") and isinstance(value, (str, int, float, bool, list, tuple, type(None)))}
+              if not key.startswith("_") and isinstance(value, (str, int, float, bool, list, tuple, dict, type(None)))}
     (log_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     (log_dir / "split.json").write_text(json.dumps({"train": train_dataset.indices, "val": val_dataset.indices}), encoding="utf-8")
 
-    resume_path = hp_get("resume_transformer_tacotron_path", None)
-    start_epoch, global_step = maybe_resume_from_checkpoint(model, optimizer, scaler, resume_path, device)
+    start_epoch, global_step = maybe_resume_from_checkpoint(
+        model, optimizer, scaler, resume_path, device, sampling_scheduler=sampling_scheduler,
+        weights_only=weights_only, freeze_config=freeze_config,
+    )
 
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size  : {len(val_dataset)}")
@@ -721,14 +837,20 @@ def main() -> None:
     writer.add_text("config/base_lr", f"{float(hp.lr):.6e}", 0)
     writer.add_text("config/weight_decay", f"{get_weight_decay():.6e}", 0)
 
-    best_mel_loss = float("inf")
+    best_mel_loss = float(previous_state.get("best_mel_loss", float("inf")))
+
+    def training_state():
+        return {"sampling_scheduler": sampling_scheduler.state_dict(), "freeze": freeze_config,
+                "split": {"train": train_dataset.indices, "val": val_dataset.indices},
+                "dataset_fingerprint": dataset_fingerprint, "best_mel_loss": best_mel_loss}
+
     for epoch in range(start_epoch, int(hp.epochs)):
         epoch_idx = epoch + 1
         if use_bucket_sampler:
             batch_sampler.set_epoch(epoch)
-        else:
-            train_loader.generator.manual_seed(seed + epoch)
+        train_loader.generator.manual_seed(seed + epoch)
         model.train()
+        set_frozen_eval(unwrap_model(model), freeze_config)
 
         current_lr = get_lr_by_epoch(epoch)
         set_optimizer_lr(optimizer, current_lr)
@@ -738,8 +860,10 @@ def main() -> None:
         pbar = tqdm(train_loader, desc=f"epoch {epoch_idx}/{int(hp.epochs)}")
         train_epoch_metrics = []
         last_outputs = None
+        current_teacher_forcing_ratio = sampling_scheduler.get_ratio(epoch, global_step)
 
         for batch in pbar:
+            current_teacher_forcing_ratio = sampling_scheduler.get_ratio(epoch, global_step)
             global_step += 1
 
             outputs, metrics = train_one_step(
@@ -751,6 +875,8 @@ def main() -> None:
                 device=device,
                 amp_device_type=amp_device_type,
                 guided_attn_weight=current_guided_attn_weight,
+                teacher_forcing_ratio=current_teacher_forcing_ratio,
+                freeze_config=freeze_config,
             )
 
             last_outputs = outputs
@@ -765,9 +891,16 @@ def main() -> None:
                 melE=f"{metrics['mel_after_energy']:.4f}",
                 gaw=f"{metrics['guided_attn_weight']:.3f}",
                 lr=f"{current_lr:.2e}",
+                tf=f"{current_teacher_forcing_ratio:.3f}",
             )
 
         train_metrics = average_metric_dict(train_epoch_metrics)
+        teacher_frames = sum(metrics["_sampling_teacher_frames"] for metrics in train_epoch_metrics)
+        valid_frames = sum(metrics["_sampling_valid_frames"] for metrics in train_epoch_metrics)
+        train_metrics.pop("_sampling_teacher_frames")
+        train_metrics.pop("_sampling_valid_frames")
+        train_metrics["effective_teacher_forcing_ratio"] = teacher_frames / valid_frames if valid_frames else 1.0
+        train_metrics["replaced_frames_ratio"] = 1.0 - train_metrics["effective_teacher_forcing_ratio"]
         print(
             f"[TRAIN epoch={epoch_idx}] "
             f"loss={train_metrics['loss']:.4f} "
@@ -777,7 +910,9 @@ def main() -> None:
             f"sharp={train_metrics['attention_sharpness']:.4f} "
             f"melE={train_metrics['mel_after_energy']:.4f} "
             f"gaw={train_metrics['guided_attn_weight']:.3f} "
-            f"lr={current_lr:.2e}"
+            f"lr={current_lr:.2e} "
+            f"tf={train_metrics['teacher_forcing_ratio']:.3f} "
+            f"effective_tf={train_metrics['effective_teacher_forcing_ratio']:.3f}"
         )
 
         for key, value in train_metrics.items():
@@ -790,17 +925,13 @@ def main() -> None:
         if (epoch + 1) % get_sample_every_epoch() == 0:
             save_validation_sample(model, val_dataset, device, sample_dir, epoch_idx)
 
-        if (epoch + 1) % get_checkpoint_every_epoch() == 0 or epoch_idx == int(hp.epochs):
-            ckpt_path = checkpoint_dir / f"checkpoint_transformer_tacotron2_epoch_{epoch_idx:04d}.pth.tar"
-            save_checkpoint(model, optimizer, scaler, epoch_idx, global_step, ckpt_path)
-            cleanup_old_checkpoints(checkpoint_dir, keep_last_n=get_max_checkpoints_to_keep())
-            print(f"Saved checkpoint: {ckpt_path}")
-
-        save_checkpoint(model, optimizer, scaler, epoch_idx, global_step, checkpoint_dir / "transformer_last.pth.tar")
-
         if (epoch + 1) % get_val_every_epoch() == 0 or epoch_idx == int(hp.epochs):
             val_guided_attn_weight = guided_attn_scheduler.get_weight(epoch)
-            val_metrics = validate(model, criterion, val_loader, device, amp_device_type, val_guided_attn_weight)
+            val_metrics = validate(
+                model, criterion, val_loader, device, amp_device_type, val_guided_attn_weight,
+                teacher_forcing_ratio=current_teacher_forcing_ratio,
+                sampling_validation=bool(sampling_config.get("enabled", False) and sampling_config.get("validation_enabled", False)),
+            )
 
             print(
                 f"[VAL epoch={epoch_idx}] "
@@ -820,9 +951,18 @@ def main() -> None:
             # Use the same mel objective even while the guided-attention weight changes.
             if val_metrics["mel_after_loss"] < best_mel_loss:
                 best_mel_loss = val_metrics["mel_after_loss"]
-                save_checkpoint(model, optimizer, scaler, epoch_idx, global_step, checkpoint_dir / "transformer_best.pth.tar")
+                save_checkpoint(model, optimizer, scaler, epoch_idx, global_step,
+                                checkpoint_dir / "transformer_best.pth.tar", training_state())
             for key, value in val_metrics.items():
                 writer.add_scalar(f"val/{key}", value, epoch_idx)
+
+        save_checkpoint(model, optimizer, scaler, epoch_idx, global_step,
+                        checkpoint_dir / "transformer_last.pth.tar", training_state())
+        if epoch_idx % get_checkpoint_every_epoch() == 0 or epoch_idx == int(hp.epochs):
+            ckpt_path = checkpoint_dir / f"checkpoint_transformer_tacotron2_epoch_{epoch_idx:04d}.pth.tar"
+            save_checkpoint(model, optimizer, scaler, epoch_idx, global_step, ckpt_path, training_state())
+            cleanup_old_checkpoints(checkpoint_dir, keep_last_n=get_max_checkpoints_to_keep())
+            print(f"Saved checkpoint: {ckpt_path}")
 
     writer.close()
 
